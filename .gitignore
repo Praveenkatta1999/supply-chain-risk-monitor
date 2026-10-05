@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.ruff_cache/
+dist/
+build/
+*.egg-info/
+
+# Local config and secrets: never commit credentials
+.env
+*.pem
+*-key.json
+*_key.json
+credentials*.json
+service-account*.json
+application_default_credentials.json
+
+# Exported data
+data/*
+!data/.gitkeep
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

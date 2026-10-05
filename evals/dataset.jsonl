@@ -1,0 +1,2 @@
+# One JSON object per line. Lines starting with "#" are skipped. Schema (see EvalCase in run_evals.py):
+# {"case_id": "str", "site_id": "str", "event": {<scrm.schemas.Event>}, "expected_affects_site": bool, "expected_severity": 1-5 | null, "notes": "str"}
