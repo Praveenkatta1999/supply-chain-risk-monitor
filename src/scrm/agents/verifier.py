@@ -160,6 +160,8 @@ async def run(
             "verifier.done",
             extra={
                 "event_id": request.event.event_id,
+                "site_id": request.site.site_id,
+                "title": request.event.title,
                 "url": str(url),
                 "verdict": result.verdict,
                 "scope": result.scope,

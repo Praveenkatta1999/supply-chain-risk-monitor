@@ -17,6 +17,7 @@ from pathlib import Path
 
 from evals.run_evals import DEFAULT_DATASET, EvalCase, load_cases
 from scrm.schemas import VerifiedEvent
+from scrm.urls import article_key
 
 RUNS_DIR = Path("data/runs")
 
@@ -43,7 +44,7 @@ def cases_from_run(run_id: str, runs_dir: Path = RUNS_DIR) -> list[EvalCase]:
 
 def _story_keys(case: EvalCase) -> set[tuple[str, str]]:
     urls = [case.event.source_url, *case.event.supporting_urls]
-    return {(case.site_id, str(url)) for url in urls}
+    return {(case.site_id, article_key(url)) for url in urls}
 
 
 def new_cases(existing: list[EvalCase], candidates: list[EvalCase]) -> list[EvalCase]:

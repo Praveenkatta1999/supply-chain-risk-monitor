@@ -61,8 +61,10 @@ site, history, opinion.
 Be inclusive when unsure, because a later step reads the full article; but do not pick a
 story only because it mentions the site or its company.
 
-Return picks: for each chosen story, its candidate_id and a one-line reason in English.
-Return an empty list if none qualify.
+Return picks: for each chosen story, its candidate_id, a one-line reason in English, and
+certainty: "clear" if the metadata clearly shows a disruption at or affecting this site
+(for example the headline names a strike, closure, fire or outage there), "possible" if
+it only might. Return an empty list if none qualify.
 """
 
 
@@ -137,10 +139,12 @@ async def run(
         unknown = [p.candidate_id for p in picks if p.candidate_id not in by_id]
         if unknown:
             log.warning("triage.unknown_ids", extra={"site_id": site.site_id, "ids": unknown})
-        chosen = {p.candidate_id: p.reason for p in picks if p.candidate_id in by_id}
+        chosen = {p.candidate_id: p for p in picks if p.candidate_id in by_id}
         # Keep the ranking order, not the order the model listed them in.
         selected = [
-            TriageSelection(event_id=e.event_id, reason=chosen[cid])
+            TriageSelection(
+                event_id=e.event_id, reason=chosen[cid].reason, certainty=chosen[cid].certainty
+            )
             for cid, e in by_id.items()
             if cid in chosen
         ]

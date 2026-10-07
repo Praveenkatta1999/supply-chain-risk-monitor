@@ -59,7 +59,8 @@ status and confidence before the brief is rendered. Every run has one run ID on 
 log line, so a brief can be traced end to end.
 
 The `root_agent` sits on top: it turns a plain-language question into sites and dates,
-runs the pipeline as a tool, and answers with the brief attached
+runs the pipeline as a tool, and answers with the brief attached. Scripts print one-line
+progress and keep the full JSON log in `data/logs/<run_id>.jsonl` (`--verbose` to show it)
 (`uv run --env-file .env python scripts/ask.py "What are the risks to our chip supply this week?"`).
 
 Built with [Google ADK](https://adk.dev/), Gemini on Gemini Enterprise Agent Platform

@@ -165,3 +165,51 @@ def test_a_failed_score_leaves_the_event_unscored(monkeypatch, site, event):
         orchestrator._score_confirmed([confirmed], site, RunContext.new(), asyncio.Semaphore(1))
     )
     assert scores == []
+
+
+def test_only_clearly_relevant_unverifiable_stories_are_investigated(
+    monkeypatch, site, event, date_range
+):
+    investigated = []
+
+    async def query_run(request, ctx, *, tool, sites):
+        events = [
+            event.model_copy(update={"event_id": eid, "source_url": f"https://news.example/{eid}"})
+            for eid in ("clear", "possible")
+        ]
+        return QueryResult(events=events, sql=[], bytes_processed=0)
+
+    async def triage_run(site, events, ctx):
+        return TriageResult(
+            site_id=site.site_id,
+            considered=2,
+            selected=[
+                TriageSelection(event_id="clear", reason="Fab fire.", certainty="clear"),
+                TriageSelection(event_id="possible", reason="Maybe.", certainty="possible"),
+            ],
+        )
+
+    async def run_many(requests, ctx, *, limit):
+        return [
+            VerifiedEvent(
+                event=r.event,
+                verdict=Verdict.UNVERIFIABLE,
+                reason="403",
+                evidence_url=r.event.source_url,
+            )
+            for r in requests
+        ]
+
+    async def investigate_story(verified, site, search_until, tool, *, triage_note):
+        investigated.append((verified.event.event_id, triage_note))
+        return None
+
+    monkeypatch.setattr(query_agent, "load_sites", lambda tool, ids: [site])
+    monkeypatch.setattr(query_agent, "run", query_run)
+    monkeypatch.setattr(triage, "run", triage_run)
+    monkeypatch.setattr(verifier, "run_many", run_many)
+    monkeypatch.setattr(investigator, "investigate_story", investigate_story)
+
+    request = BriefRequest(site_ids=[site.site_id], date_range=date_range)
+    asyncio.run(orchestrator.run_pipeline(request, RunContext.new(), tool=object()))
+    assert investigated == [("clear", "Fab fire.")]

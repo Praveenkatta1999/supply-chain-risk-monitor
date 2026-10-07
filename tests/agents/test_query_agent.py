@@ -223,3 +223,9 @@ def test_site_without_aliases_skips_the_entity_query(date_range):
     request = QueryRequest(site_ids=["X99"], date_range=date_range)
     asyncio.run(query_agent.run(request, RunContext.new(), tool=tool, sites=[unnamed]))
     assert not any("@org_pattern" in sql for sql in tool.statements)
+
+
+def test_http_and_https_copies_are_one_candidate():
+    http = query_agent.candidate_from_gkg(gkg_row("a", "http://x.example/port-strike"), SITE)
+    https = query_agent.candidate_from_gkg(gkg_row("b", "https://x.example/port-strike"), SITE)
+    assert len(query_agent.best_per_url([http, https])) == 1

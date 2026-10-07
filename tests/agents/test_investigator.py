@@ -246,3 +246,65 @@ def test_investigator_temperature_comes_from_settings(site):
         unset.generate_content_config is None or unset.generate_content_config.temperature is None
     )
     assert investigator.build_agent(Settings(), kit).generate_content_config.temperature == 0.2
+
+
+def test_unverifiable_story_gets_its_title_and_triage_note(event, site):
+    titled = event.model_copy(update={"title": "port strike halts terminals"})
+    unverifiable = VerifiedEvent(
+        event=titled, verdict=Verdict.UNVERIFIABLE, reason="403", evidence_url=event.source_url
+    )
+    seen = []
+
+    async def investigate(payload, kit):
+        seen.append(payload)
+        return InvestigationJudgement(summary="s", status="unclear", confidence="low")
+
+    result = asyncio.run(
+        investigator.investigate_story(
+            unverifiable, site, date(2026, 10, 5), FakeTool([]),
+            triage_note="Headline reports a strike at the port.", investigate=investigate,
+        )
+    )  # fmt: skip
+    assert seen[0].story_title == "port strike halts terminals"
+    assert seen[0].triage_note == "Headline reports a strike at the port."
+    assert result.title == "port strike halts terminals"
+
+
+def test_untitled_story_falls_back_to_the_triage_note(event, site):
+    unverifiable = VerifiedEvent(
+        event=event.model_copy(update={"title": None}), verdict=Verdict.UNVERIFIABLE,
+        reason="403", evidence_url=event.source_url,
+    )  # fmt: skip
+
+    async def investigate(payload, kit):
+        assert payload.claim == "Fab outage reported."
+        return InvestigationJudgement(summary="s", status="unclear", confidence="low")
+
+    result = asyncio.run(
+        investigator.investigate_story(
+            unverifiable, site, date(2026, 10, 5), FakeTool([]),
+            triage_note="Fab outage reported.", investigate=investigate,
+        )
+    )  # fmt: skip
+    assert result.title == "Fab outage reported."
+
+
+def test_own_source_over_http_is_not_corroboration(event, site):
+    own = "https://own.example/story"
+    v = confirmed(event.model_copy(update={"source_url": own}))
+    rows = [{"url": "http://own.example/story", "source": "own.example", "day": date(2026, 10, 1),
+             "place": "X"}]  # fmt: skip
+
+    async def investigate(payload, kit):
+        await kit.search_news("story words here")
+        return InvestigationJudgement(
+            summary="s", status="ongoing", confidence="low", corroborating_ids=["R1"]
+        )
+
+    item = claim_item(event.model_copy(update={"source_url": own}), 4, 4)
+    result = asyncio.run(
+        investigator.investigate_claim(
+            item, [v], site, date(2026, 10, 5), FakeTool(rows), investigate=investigate
+        )
+    )
+    assert result.corroborating_urls == []

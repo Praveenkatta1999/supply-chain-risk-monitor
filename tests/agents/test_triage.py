@@ -74,3 +74,14 @@ def test_failed_call_falls_back_to_top_ranked(event, site):
     result = asyncio.run(triage.run(site, candidates(event, 30), RunContext.new(), draft=broken))
     assert result.fallback
     assert [s.event_id for s in result.selected] == [f"e{i}" for i in range(1, 21)]
+
+
+def test_certainty_is_carried_and_defaults_to_possible(event, site):
+    picks = [
+        TriagePick(candidate_id="C1", reason="Terminal fire.", certainty="clear"),
+        TriagePick(candidate_id="C2", reason="Maybe congestion."),
+    ]
+    result = asyncio.run(
+        triage.run(site, candidates(event, 2), RunContext.new(), draft=drafter(picks))
+    )
+    assert [s.certainty for s in result.selected] == ["clear", "possible"]

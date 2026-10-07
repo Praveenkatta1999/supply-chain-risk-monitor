@@ -37,6 +37,7 @@ from scrm.config import get_settings
 from scrm.schemas import Event, QueryRequest, QueryResult, Site
 from scrm.telemetry import RunContext, get_logger
 from scrm.tools.bigquery_tool import BigQueryTool
+from scrm.urls import article_key
 
 NAME = "query_agent"
 INPUT_SCHEMA = QueryRequest
@@ -183,11 +184,12 @@ def candidate_from_coded_event(row: dict[str, Any], site: Site) -> Candidate:
 
 
 def best_per_url(candidates: list[Candidate]) -> list[Candidate]:
-    """Keep the highest-relevance candidate for each URL, ordered by relevance (desc)."""
+    """Keep the highest-relevance candidate per article (http and https are the same),
+    ordered by relevance (desc)."""
     ordered = sorted(candidates, key=lambda c: c.event.relevance or 0.0, reverse=True)
     best: dict[str, Candidate] = {}
     for candidate in ordered:
-        best.setdefault(str(candidate.event.source_url), candidate)
+        best.setdefault(article_key(candidate.event.source_url), candidate)
     return list(best.values())
 
 

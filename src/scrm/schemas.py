@@ -312,9 +312,18 @@ class TriageInput(_Model):
     candidates: list[TriageCandidate]
 
 
+Certainty = Literal["clear", "possible"]
+
+
 class TriagePick(_Model):
     candidate_id: str
     reason: str = Field(description="One line, in English.")
+    # Defaults to "possible" if the model leaves it out: an unclear pick is never investigated.
+    certainty: Certainty = Field(
+        default="possible",
+        description="'clear' if the metadata clearly shows a disruption at or affecting this "
+        "site; 'possible' if it only might.",
+    )
 
 
 class TriageDraft(_Model):
@@ -326,6 +335,7 @@ class TriageDraft(_Model):
 class TriageSelection(_Model):
     event_id: str
     reason: str
+    certainty: Certainty = "possible"
 
 
 class TriageResult(_Model):
@@ -381,6 +391,12 @@ class InvestigatorInput(_Model):
     site: Site
     subject: Literal["claim", "unverifiable_story"]
     claim: str
+    story_title: str | None = Field(
+        default=None, description="Headline words from the story's URL, if any."
+    )
+    triage_note: str | None = Field(
+        default=None, description="Triage's one-line reason for picking the story."
+    )
     sources: list[InvestigatorSource]
     search_until: date
     severity: Score | None
@@ -430,6 +446,7 @@ class Investigation(_Model):
 
     item_id: str | None = None
     event_id: str | None = None
+    title: str | None = Field(default=None, description="What the story is about, for display.")
     site_id: str
     source_url: HttpUrl
     source_urls: list[HttpUrl] = Field(default_factory=list)
