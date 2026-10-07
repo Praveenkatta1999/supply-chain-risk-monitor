@@ -15,6 +15,7 @@ dependencies = [
 
 [dependency-groups]
 dev = [
+    "pyarrow>=25,<26",
     "pytest>=9.1,<10",
     "ruff>=0.16,<0.17",
 ]

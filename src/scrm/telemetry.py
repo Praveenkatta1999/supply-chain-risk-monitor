@@ -14,13 +14,14 @@ brief can be filtered with a single field in Cloud Logging.
 import json
 import logging
 import uuid
+from collections import Counter
 from collections.abc import Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
-_run_id: ContextVar[str | None] = ContextVar("run_id", default=None)
+_context: ContextVar["RunContext | None"] = ContextVar("run_context", default=None)
 
 # Attributes every LogRecord has; anything else came from `extra=` and is logged as a field.
 _STANDARD_ATTRS = set(logging.makeLogRecord({}).__dict__) | {"message", "asctime"}
@@ -31,9 +32,15 @@ def new_run_id() -> str:
     return uuid.uuid4().hex[:12]
 
 
+def current_context() -> "RunContext | None":
+    """Return the RunContext bound to the current context, if any."""
+    return _context.get()
+
+
 def current_run_id() -> str | None:
     """Return the run ID bound to the current context, if any."""
-    return _run_id.get()
+    ctx = _context.get()
+    return ctx.run_id if ctx else None
 
 
 @dataclass(frozen=True)
@@ -41,6 +48,7 @@ class RunContext:
     """Per-run state passed to every agent."""
 
     run_id: str = field(default_factory=new_run_id)
+    model_calls: Counter[str] = field(default_factory=Counter, compare=False)
 
     @classmethod
     def new(cls) -> "RunContext":
@@ -49,11 +57,14 @@ class RunContext:
     @contextmanager
     def bind(self) -> Iterator["RunContext"]:
         """Attach this run ID to all log records emitted inside the block."""
-        token = _run_id.set(self.run_id)
+        token = _context.set(self)
         try:
             yield self
         finally:
-            _run_id.reset(token)
+            _context.reset(token)
+
+    def record_model_call(self, agent_name: str) -> None:
+        self.model_calls[agent_name] += 1
 
 
 class JsonFormatter(logging.Formatter):

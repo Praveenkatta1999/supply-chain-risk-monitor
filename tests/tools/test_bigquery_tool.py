@@ -25,6 +25,7 @@ class FakeClient:
     tables: list = field(default_factory=lambda: [SCRM_TABLE])
     statement_type: str = "SELECT"
     calls: list = field(default_factory=list)
+    page_sizes: list = field(default_factory=list)
 
     def query(self, sql, job_config, location):
         self.calls.append(job_config)
@@ -34,10 +35,12 @@ class FakeClient:
                 referenced_tables=self.tables,
                 statement_type=self.statement_type,
             )
-        return SimpleNamespace(
-            result=lambda: [{"site_id": "SUP-01", "n": 3}],
-            total_bytes_processed=self.estimated_bytes,
-        )
+
+        def result(page_size=None):
+            self.page_sizes.append(page_size)
+            return [{"site_id": "SUP-01", "n": 3}]
+
+        return SimpleNamespace(result=result, total_bytes_processed=self.estimated_bytes)
 
     @property
     def executed(self) -> list:
@@ -65,6 +68,15 @@ def test_counts_bytes_processed():
     assert tool.bytes_processed == 800
 
 
+def test_query_rows_is_guarded_and_passes_page_size():
+    client = FakeClient(estimated_bytes=500)
+    rows = make_tool(client).query_rows("SELECT 1", page_size=50)
+    assert list(rows) == [{"site_id": "SUP-01", "n": 3}]
+    assert client.page_sizes == [50]
+    with pytest.raises(QueryTooExpensiveError):
+        make_tool(FakeClient(estimated_bytes=1_001)).query_rows("SELECT * FROM big")
+
+
 def test_refuses_and_never_executes_when_over_limit():
     client = FakeClient(estimated_bytes=1_001)
     with pytest.raises(QueryTooExpensiveError):
@@ -76,6 +88,15 @@ def test_limit_is_configurable():
     client = FakeClient(estimated_bytes=5_000)
     make_tool(client, limit=10_000).run_query("SELECT 1")
     assert len(client.executed) == 1
+
+
+def test_fork_has_its_own_byte_counter_and_same_limit():
+    client = FakeClient(estimated_bytes=400)
+    tool = make_tool(client)
+    fork = tool.fork()
+    fork.run_query("SELECT 1")
+    assert (tool.bytes_processed, fork.bytes_processed) == (0, 400)
+    assert fork.max_bytes_billed == tool.max_bytes_billed
 
 
 def test_with_max_bytes_applies_new_limit():

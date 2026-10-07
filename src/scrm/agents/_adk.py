@@ -2,12 +2,15 @@
 
 Each call uses a fresh in-memory session: the agents in this project are single-turn
 functions (JSON in, JSON out), so no conversation state needs to survive between calls.
+Calls are counted on the bound RunContext (``model_calls``) for cost reporting.
 """
 
 from google.adk.agents import LlmAgent
 from google.adk.runners import InMemoryRunner
 from google.genai import types
 from pydantic import BaseModel
+
+from scrm.telemetry import current_context
 
 APP_NAME = "scrm"
 USER_ID = "pipeline"
@@ -23,6 +26,8 @@ async def run_structured[M: BaseModel](
     """Send ``payload`` as JSON to ``agent`` and validate the result as ``output_model``."""
     if not agent.output_key:
         raise ValueError(f"agent {agent.name} needs an output_key")
+    if ctx := current_context():
+        ctx.record_model_call(agent.name)
     runner = InMemoryRunner(agent=agent, app_name=APP_NAME)
     try:
         session = await runner.session_service.create_session(app_name=APP_NAME, user_id=USER_ID)
