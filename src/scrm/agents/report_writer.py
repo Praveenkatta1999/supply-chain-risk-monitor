@@ -237,6 +237,9 @@ def _investigation_line(inv: Investigation) -> str:
     )
     if inv.corroborating_urls:
         line += f" Corroborating: {_links(inv.corroborating_urls, 'c')}."
+    for e in inv.evidence:
+        if e.stance == "contradicts":
+            line += f'\n   Contradicting evidence: "{e.quote}" ([source]({e.url}))'
     return line
 
 

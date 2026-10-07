@@ -1,7 +1,7 @@
 """Run the full pipeline for one or more sites and print the brief.
 
 Usage:
-    uv run --env-file .env python scripts/run_brief.py [--sites P05 S01] [--days 30]
+    uv run --env-file .env python scripts/run_brief.py [--sites P05 S01 | --sites all] [--days 30]
         [--end 2026-10-05] [--compare RUN_ID]
 
 Logs (JSON, one line per event, all carrying the run ID) go to stderr. The Markdown brief,
@@ -29,7 +29,9 @@ log = get_logger("run_brief")
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--sites", nargs="+", default=["P05"], help="site_ids from scrm.sites")
+    parser.add_argument(
+        "--sites", nargs="+", default=["P05"], help="site_ids from scrm.sites, or 'all'"
+    )
     parser.add_argument("--days", type=int, default=30, help="window length, inclusive")
     parser.add_argument("--end", type=date.fromisoformat, help="last day (default: today, UTC)")
     parser.add_argument("--compare", metavar="RUN_ID", help="earlier saved run to compare")
@@ -112,7 +114,7 @@ async def main(argv: list[str]) -> int:
     ctx = RunContext.new()
     end = args.end or datetime.now(UTC).date()
     request = BriefRequest(
-        site_ids=args.sites,
+        site_ids=[] if args.sites == ["all"] else args.sites,  # empty means every site
         date_range=DateRange(start=end - timedelta(days=args.days - 1), end=end),
     )
     result = await orchestrator.run_pipeline(request, ctx)

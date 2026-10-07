@@ -33,16 +33,19 @@ from typing import Any, Literal
 from google.adk.agents import LlmAgent, RunConfig
 from google.adk.agents.invocation_context import LlmCallsLimitExceededError
 from google.cloud import bigquery
+from google.genai import types
 from pydantic import HttpUrl
 
 from scrm.agents import clustering
 from scrm.agents._adk import run_structured
+from scrm.agents.verifier import quote_in_text
 from scrm.config import Settings, get_settings
 from scrm.schemas import (
     Article,
     BriefItem,
     FetchFailure,
     Investigation,
+    InvestigationEvidence,
     InvestigationJudgement,
     InvestigatorInput,
     InvestigatorSource,
@@ -89,12 +92,30 @@ Tools (at most {MAX_TOOL_CALLS} calls in total, so plan them):
 - read_article(result_id): read an article by ID: the story's own sources (F1, F2, ...)
   or search results (R1, R2, ...).
 
+How to work, so that the same story gets the same answer every time:
+1. Read the story's own sources first (F1, ...).
+2. Search with the most distinctive words from the claim or the source titles (a
+   company, place or event name), then once more with words for an end or recovery
+   (e.g. "reopened", "restarted", "resumed", "lifted") to check whether it is over.
+3. Read the most recent relevant results.
+
+Decide with these rules, not by impression:
+- status "resolved": a report dated after the event explicitly says it ended, reopened,
+  restarted or was lifted. "ongoing": a report within 7 days of search_until says it
+  continues, or a source gives an end date after search_until. Otherwise "unclear".
+- confidence "high": two or more independent sources (different publishers) agree with
+  the claim and nothing you read contradicts it. "medium": exactly one independent
+  source agrees, or sources partly conflict. "low": none found, or they mostly conflict.
+- If the tools return nothing useful: status "unclear", confidence "low".
+
 Return:
 - summary: at most three sentences in English with what the evidence shows.
-- status: "ongoing", "resolved" or "unclear".
-- confidence: "high" (several independent reports agree and are recent), "medium" (some
-  support), or "low" (little or conflicting evidence).
+- status, confidence: by the rules above.
 - corroborating_ids: search result IDs (R...) that independently support the story.
+- evidence: up to five short excerpts copied VERBATIM from articles you read (or a
+  search result's title), each with its result_id and stance: "supports" or
+  "contradicts" the claim, or "context". Always include evidence that contradicts any
+  part of the claim (for example, reports that traffic has returned to normal).
 Base everything on what the tools returned; never invent sources or facts.
 """
 
@@ -182,6 +203,7 @@ class Toolkit:
     fetch: Fetcher = fetch_article
     results: dict[str, str] = field(default_factory=dict)  # result ID -> URL (F0 preset)
     searched: int = 0  # search results registered so far, numbered R1, R2, ...
+    texts: dict[str, str] = field(default_factory=dict)  # result ID -> text/title seen
     calls: int = 0
     refused: int = 0
 
@@ -235,10 +257,12 @@ class Toolkit:
             self.searched += 1
             result_id = f"R{self.searched}"
             self.results[result_id] = row["url"]
+            title = clustering.slug_title(row["url"])
+            self.texts[result_id] = title or ""
             results.append(
                 {
                     "id": result_id,
-                    "title": clustering.slug_title(row["url"]),
+                    "title": title,
                     "source": row["source"],
                     "date": str(row["day"]),
                     "place": row["place"],
@@ -261,16 +285,29 @@ class Toolkit:
         article = await self.fetch(url)
         if isinstance(article, FetchFailure):
             return {"status": "error", "message": f"Could not read it ({article.reason})."}
+        key = result_id.strip().upper()
+        shown = article.text[:MAX_ARTICLE_CHARS]
+        self.texts[key] = f"{article.title or ''}\n{self.texts.get(key, '')}\n{shown}"
         return {
             "status": "ok",
             "title": article.title,
-            "text": article.text[:MAX_ARTICLE_CHARS],
+            "text": shown,
             "tool_calls_left": self.remaining(),
         }
 
 
 def build_agent(settings: Settings, toolkit: Toolkit) -> LlmAgent:
-    """Return the agent for one story. Constructing it makes no network calls."""
+    """Return the agent for one story. Constructing it makes no network calls.
+
+    Temperature comes from ``settings.investigator_temperature`` (0.2 by default, chosen to
+    reduce run-to-run variance; None leaves the model default, which Google recommends for
+    Gemini 3.x models).
+    """
+    config = (
+        types.GenerateContentConfig(temperature=settings.investigator_temperature)
+        if settings.investigator_temperature is not None
+        else None
+    )
     return LlmAgent(
         name=NAME,
         model=settings.gemini_model,
@@ -281,6 +318,7 @@ def build_agent(settings: Settings, toolkit: Toolkit) -> LlmAgent:
         output_key=NAME,
         tools=[toolkit.search_news, toolkit.read_article],
         before_tool_callback=toolkit.before_tool,
+        generate_content_config=config,
     )
 
 
@@ -315,6 +353,26 @@ def _source(source_id: str, verified: VerifiedEvent) -> InvestigatorSource:
         reason=verified.reason,
         quote=verified.quote,
     )
+
+
+MAX_EVIDENCE = 5
+
+
+def checked_evidence(
+    judgement: InvestigationJudgement, toolkit: Toolkit, subject_id: str
+) -> list[InvestigationEvidence]:
+    """Keep only excerpts that appear verbatim in what the tools returned for that ID."""
+    kept, dropped = [], 0
+    for snippet in judgement.evidence[:MAX_EVIDENCE]:
+        seen = toolkit.texts.get(snippet.result_id.strip().upper(), "")
+        url = toolkit.results.get(snippet.result_id.strip().upper())
+        if url and quote_in_text(snippet.quote, seen):
+            kept.append(InvestigationEvidence(url=url, quote=snippet.quote, stance=snippet.stance))
+        else:
+            dropped += 1
+    if dropped:
+        log.warning("investigator.evidence_dropped", extra={"subject_id": subject_id, "n": dropped})
+    return kept
 
 
 async def investigate_claim(
@@ -432,6 +490,7 @@ async def _run(
     if unknown:
         log.warning("investigator.unknown_ids", extra={"subject_id": subject_id, "ids": unknown})
     source_urls = [v.evidence_url for v in events]
+    evidence = checked_evidence(judgement, toolkit, subject_id)
     result = Investigation(
         item_id=item_id,
         event_id=event_id,
@@ -445,6 +504,7 @@ async def _run(
         corroborating_urls=list(dict.fromkeys(u for u in cited if u not in own)),
         tool_calls=min(toolkit.calls, MAX_TOOL_CALLS),
         hit_limit=hit_limit or toolkit.refused > 0,
+        evidence=evidence,
     )
     log.info(
         "investigator.done",

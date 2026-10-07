@@ -190,3 +190,31 @@ def test_revisions_change_only_the_claims_that_were_asked_about():
     assert [i.claim for i in revised] == ["New one.", "Old two."]
     assert [i.revisions for i in revised] == [1, 0]
     assert revised[0].source_urls == items[0].source_urls  # sources never change
+
+
+def test_contradicting_evidence_is_shown_with_its_source(site, date_range):
+    from scrm.schemas import Investigation, InvestigationEvidence
+
+    item = reviewed_item("I1", "Suez traffic is falling.", 5, "ongoing")
+    inv = Investigation(
+        item_id="I1", site_id="SUP-01", source_url=item.source_urls[0], trigger="high_risk",
+        summary="Mixed.", status="ongoing", confidence="medium", tool_calls=5,
+        evidence=[
+            InvestigationEvidence(
+                url="https://x.example/normal", quote="Traffic is back to normal.",
+                stance="contradicts",
+            ),
+            InvestigationEvidence(
+                url="https://x.example/s", quote="Ships divert.", stance="supports"
+            ),
+        ],
+    )  # fmt: skip
+    request = ReportRequest(
+        run_id="r1", date_range=date_range, sites=[site], verified_events=[], investigations=[inv]
+    )
+    md = report_writer.render(request, [item]).markdown
+    assert (
+        'Contradicting evidence: "Traffic is back to normal." ([source](https://x.example/normal))'
+        in md
+    )
+    assert "Ships divert." not in md

@@ -6,7 +6,8 @@ Usage:
 
 The agent chooses the sites and dates and runs the pipeline once. Logs (JSON, run ID on
 every line) go to stderr. The pipeline result is saved to data/runs/<run_id>.json (the
-same format as scripts/run_brief.py) and the answer to data/runs/<run_id>.answer.json.
+same format as scripts/run_brief.py) and the answer, with model calls, to
+data/runs/<run_id>.answer.json.
 """
 
 import argparse
@@ -42,8 +43,10 @@ async def main(argv: list[str]) -> int:
         f"{answer.rationale}\n"
     )
     RUNS_DIR.mkdir(parents=True, exist_ok=True)
+    # The answer plus model calls for the whole question (the pipeline's own count stops
+    # before the root agent's final answer).
     (RUNS_DIR / f"{ctx.run_id}.answer.json").write_text(
-        answer.model_dump_json(indent=2), encoding="utf-8"
+        result.model_copy(update={"pipeline": None}).model_dump_json(indent=2), encoding="utf-8"
     )
     if result.pipeline is None:
         print("The agent did not run the pipeline.")
