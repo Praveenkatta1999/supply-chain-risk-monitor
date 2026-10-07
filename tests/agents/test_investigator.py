@@ -5,6 +5,7 @@ from types import SimpleNamespace
 from scrm.agents import investigator
 from scrm.schemas import (
     Article,
+    BriefItem,
     FetchFailure,
     FetchFailureReason,
     InvestigationJudgement,
@@ -56,21 +57,23 @@ def toolkit(site, rows=ROWS, fetch=None):
         return Article(url=url, title="T", text="Barges stuck.", fetched_at=datetime.now(UTC))
 
     return investigator.Toolkit(
-        tool=FakeTool(rows), site=site, event_id="e1", start=date(2026, 9, 1),
+        tool=FakeTool(rows), site=site, subject_id="I1", start=date(2026, 9, 1),
         end=date(2026, 10, 5), fetch=fetch or fetch_ok,
-        results={"F0": "https://own.example/story"},
+        results={"F1": "https://own.example/story"},
     )  # fmt: skip
 
 
-def test_only_high_risk_or_unverifiable_findings_are_investigated(event):
-    v = confirmed(event)
-    assert investigator.needs_investigation(v, score(event, 4, 3))  # risk 12
-    assert not investigator.needs_investigation(v, score(event, 3, 3))  # risk 9
-    assert not investigator.needs_investigation(v, None)
-    unverifiable = VerifiedEvent(
-        event=event, verdict=Verdict.UNVERIFIABLE, reason="403", evidence_url=event.source_url
-    )
-    assert investigator.needs_investigation(unverifiable, None)
+def claim_item(event, severity, impact, item_id="I1") -> BriefItem:
+    return BriefItem(
+        item_id=item_id, site_id=event.site_id, claim="Barges are stuck.", scope=Scope.INDIRECT,
+        severity=severity, impact=impact, source_urls=[event.source_url],
+    )  # fmt: skip
+
+
+def test_only_high_risk_claims_are_investigated(event):
+    assert investigator.needs_investigation(claim_item(event, 4, 3))  # risk 12
+    assert not investigator.needs_investigation(claim_item(event, 3, 3))  # risk 9
+    assert not investigator.needs_investigation(claim_item(event, None, None))
 
 
 def test_keywords_are_cleaned_and_passed_as_parameters(site):
@@ -103,7 +106,7 @@ def test_read_article_only_fetches_known_ids(site):
     kit = toolkit(site, fetch=fetch)
     assert asyncio.run(kit.read_article("R7"))["status"] == "error"
     assert fetched == []
-    assert asyncio.run(kit.read_article("f0"))["status"] == "error"  # paywalled
+    assert asyncio.run(kit.read_article("f1"))["status"] == "error"  # paywalled
     assert fetched == ["https://own.example/story"]
 
 
@@ -118,25 +121,59 @@ def test_tool_budget_is_enforced_and_every_call_logged(site, caplog):
     assert len(logged) == 10 and all(hasattr(r, "tool_args") for r in logged)
 
 
-def test_run_maps_cited_ids_to_urls_and_drops_unknown_ones(event, site):
+def second_source(event) -> VerifiedEvent:
+    other = event.model_copy(
+        update={"event_id": "e2", "source_url": "https://two.example/same-story"}
+    )
+    return confirmed(other)
+
+
+def test_claim_is_investigated_once_with_all_its_sources(event, site):
+    seen = []
+
     async def investigate(payload, kit):
-        assert payload.finding_id == "F0" and "http" not in payload.model_dump_json()
-        asyncio.get_running_loop()  # tools would be called here by the real agent
+        seen.append(payload)
         await kit.search_news("rhine low water")
         return InvestigationJudgement(
             summary="Still low.", status="ongoing", confidence="medium",
-            corroborating_ids=["R2", "F0", "R9"],
+            corroborating_ids=["R2", "F1", "R9"],
         )  # fmt: skip
 
+    sources = [confirmed(event), second_source(event)]
     result = asyncio.run(
-        investigator.run(
-            confirmed(event), score(event, 4, 4), site, date(2026, 10, 5), FakeTool(ROWS),
+        investigator.investigate_claim(
+            claim_item(event, 4, 4), sources, site, date(2026, 10, 5), FakeTool(ROWS),
             investigate=investigate,
         )
     )  # fmt: skip
-    assert result.trigger == "high_risk" and result.status == "ongoing"
+    (payload,) = seen  # one investigation for the whole claim
+    assert payload.subject == "claim"
+    assert [s.source_id for s in payload.sources] == ["F1", "F2"]
+    assert "http" not in payload.model_dump_json()
+    assert result.item_id == "I1" and result.trigger == "high_risk"
+    assert [str(u) for u in result.source_urls] == [
+        str(event.source_url),
+        "https://two.example/same-story",
+    ]
+    # Own sources (F1) and unknown IDs (R9) are not corroboration.
     assert [str(u) for u in result.corroborating_urls] == [ROWS[1]["url"]]
-    assert result.tool_calls == 0  # the fake called the tool directly, not via the callback
+
+
+def test_unverifiable_story_is_investigated_alone(event, site):
+    unverifiable = VerifiedEvent(
+        event=event, verdict=Verdict.UNVERIFIABLE, reason="403", evidence_url=event.source_url
+    )
+
+    async def investigate(payload, kit):
+        assert payload.subject == "unverifiable_story" and len(payload.sources) == 1
+        return InvestigationJudgement(summary="A drill.", status="resolved", confidence="high")
+
+    result = asyncio.run(
+        investigator.investigate_story(
+            unverifiable, site, date(2026, 10, 5), FakeTool([]), investigate=investigate
+        )
+    )
+    assert result.event_id == event.event_id and result.trigger == "unverifiable"
 
 
 def test_call_limit_gives_a_low_confidence_result(event, site):
@@ -146,8 +183,8 @@ def test_call_limit_gives_a_low_confidence_result(event, site):
         raise LlmCallsLimitExceededError("limit")
 
     result = asyncio.run(
-        investigator.run(
-            confirmed(event), score(event, 5, 5), site, date(2026, 10, 5), FakeTool([]),
+        investigator.investigate_claim(
+            claim_item(event, 5, 5), [confirmed(event)], site, date(2026, 10, 5), FakeTool([]),
             investigate=runaway,
         )
     )  # fmt: skip
@@ -159,8 +196,8 @@ def test_other_failures_return_none(event, site):
         raise RuntimeError("boom")
 
     assert asyncio.run(
-        investigator.run(
-            confirmed(event), score(event, 5, 5), site, date(2026, 10, 5), FakeTool([]),
+        investigator.investigate_claim(
+            claim_item(event, 5, 5), [confirmed(event)], site, date(2026, 10, 5), FakeTool([]),
             investigate=broken,
         )
     ) is None  # fmt: skip

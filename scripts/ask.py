@@ -1,0 +1,62 @@
+"""Ask the root agent a plain-language question and print its answer and the brief.
+
+Usage:
+    uv run --env-file .env python scripts/ask.py "What are the risks to our chip supply this week?"
+        [--today 2026-10-07]
+
+The agent chooses the sites and dates and runs the pipeline once. Logs (JSON, run ID on
+every line) go to stderr. The pipeline result is saved to data/runs/<run_id>.json (the
+same format as scripts/run_brief.py) and the answer to data/runs/<run_id>.answer.json.
+"""
+
+import argparse
+import asyncio
+import sys
+from datetime import UTC, date, datetime
+from pathlib import Path
+
+from scrm.agents import root_agent
+from scrm.config import get_settings
+from scrm.telemetry import RunContext, configure_logging
+
+RUNS_DIR = Path("data/runs")
+
+
+async def main(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("question")
+    parser.add_argument("--today", type=date.fromisoformat, help="default: today, UTC")
+    args = parser.parse_args(argv)
+    # Claims can quote any language; don't depend on the console's code page.
+    sys.stdout.reconfigure(encoding="utf-8")
+    configure_logging(get_settings().log_level)
+    ctx = RunContext.new()
+    today = args.today or datetime.now(UTC).date()
+    result = await root_agent.run(args.question, ctx, today=today)
+
+    answer = result.answer
+    print(f"# Question\n\n{args.question}\n")
+    print(f"# Answer\n\n{answer.summary}\n")
+    print(
+        f"Sites: {', '.join(answer.site_ids)}; dates {answer.start_date} to {answer.end_date}. "
+        f"{answer.rationale}\n"
+    )
+    RUNS_DIR.mkdir(parents=True, exist_ok=True)
+    (RUNS_DIR / f"{ctx.run_id}.answer.json").write_text(
+        answer.model_dump_json(indent=2), encoding="utf-8"
+    )
+    if result.pipeline is None:
+        print("The agent did not run the pipeline.")
+    else:
+        (RUNS_DIR / f"{ctx.run_id}.json").write_text(
+            result.pipeline.model_dump_json(indent=2), encoding="utf-8"
+        )
+        print(result.pipeline.brief.markdown)
+    calls = result.model_calls
+    detail = ", ".join(f"{name} {n}" for name, n in sorted(calls.items()))
+    print(f"\nModel calls: {sum(calls.values())} ({detail}). Run ID: {ctx.run_id}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(asyncio.run(main(sys.argv[1:])))

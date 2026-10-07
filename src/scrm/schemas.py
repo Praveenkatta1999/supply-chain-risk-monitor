@@ -11,6 +11,8 @@ from typing import Annotated, Literal, Self
 from pydantic import BaseModel, ConfigDict, Field, HttpUrl, model_validator
 
 Score = Annotated[int, Field(ge=1, le=5)]
+Status = Literal["ongoing", "resolved", "unclear"]
+Confidence = Literal["high", "medium", "low"]
 
 
 class _Model(BaseModel):
@@ -175,11 +177,22 @@ class RiskScore(_Model):
 
 
 class BriefItem(_Model):
-    """One claim in the brief. A claim without a source URL is invalid."""
+    """One claim in the brief. A claim without a source URL is invalid.
 
+    ``status``, ``confidence`` and ``contradictions`` come from the reviewer's final pass;
+    ``revisions`` counts how many times the report writer rewrote the claim on its request.
+    """
+
+    item_id: str | None = Field(default=None, description="I1, I2, ... within one brief.")
     site_id: str
     claim: str = Field(min_length=1)
     scope: Scope | None = None
+    status: Status | None = None
+    confidence: Confidence | None = None
+    contradictions: list[str] = Field(
+        default_factory=list, description="Statements the evidence contradicts (reviewer)."
+    )
+    revisions: int = Field(default=0, ge=0)
     severity: Score | None = None
     impact: Score | None = None
     source_urls: list[HttpUrl] = Field(min_length=1, description="Verified sources.")
@@ -350,18 +363,26 @@ class RiskJudgement(_Model):
     reason: str = Field(description="One sentence, in English.")
 
 
-class InvestigatorInput(_Model):
-    """What the investigator model is asked to check. URLs are replaced by result IDs."""
+class InvestigatorSource(_Model):
+    """One of the story's own sources, as the investigator sees it (no URL)."""
 
-    site: Site
-    finding_id: str = Field(description="Result ID of the finding's own article (F0).")
+    source_id: str = Field(description="Result ID for read_article: F1, F2, ...")
     title: str | None
     event_date: date
-    search_until: date
     verdict: Verdict
     scope: Scope | None
     reason: str
     quote: str | None
+
+
+class InvestigatorInput(_Model):
+    """What the investigator model is asked to check: one claim, or one unverifiable story."""
+
+    site: Site
+    subject: Literal["claim", "unverifiable_story"]
+    claim: str
+    sources: list[InvestigatorSource]
+    search_until: date
     severity: Score | None
     impact: Score | None
 
@@ -370,23 +391,30 @@ class InvestigationJudgement(_Model):
     """The investigator model's structured answer."""
 
     summary: str = Field(description="At most three sentences, in English.")
-    status: Literal["ongoing", "resolved", "unclear"]
-    confidence: Literal["high", "medium", "low"]
+    status: Status
+    confidence: Confidence
     corroborating_ids: list[str] = Field(
         default_factory=list, description="Result IDs (R1, R2, ...) that corroborate it."
     )
 
 
 class Investigation(_Model):
-    """An investigated finding, with corroborating sources mapped back to URLs."""
+    """One investigated story (a brief claim or an unverifiable story), sources mapped to URLs.
 
-    event_id: str
+    Claims are identified by ``item_id``; unverifiable stories by ``event_id``.
+    ``source_url`` is the first of ``source_urls`` (kept for runs saved before claims were
+    investigated as a whole).
+    """
+
+    item_id: str | None = None
+    event_id: str | None = None
     site_id: str
     source_url: HttpUrl
+    source_urls: list[HttpUrl] = Field(default_factory=list)
     trigger: Literal["high_risk", "unverifiable"]
     summary: str
-    status: Literal["ongoing", "resolved", "unclear"]
-    confidence: Literal["high", "medium", "low"]
+    status: Status
+    confidence: Confidence
     corroborating_urls: list[HttpUrl] = Field(default_factory=list)
     tool_calls: int = Field(ge=0)
     hit_limit: bool = False
@@ -441,6 +469,81 @@ class ReportDraft(_Model):
     items: list[DraftItem]
 
 
+class ReviewEvidence(_Model):
+    reason: str
+    quote: str | None
+
+
+class ReviewItem(_Model):
+    """One claim as the reviewer sees it, with all the evidence behind it (no URLs)."""
+
+    item_id: str
+    site_id: str
+    scope: Scope | None
+    claim: str
+    severity: Score | None
+    impact: Score | None
+    verifier_evidence: list[ReviewEvidence]
+    investigation_summary: str | None
+    investigation_status: Status | None
+    investigation_confidence: Confidence | None
+
+
+class ReviewInput(_Model):
+    items: list[ReviewItem]
+
+
+class ClaimReview(_Model):
+    item_id: str
+    status: Status = Field(description="Is the disruption ongoing, resolved, or unclear?")
+    confidence: Confidence
+    contradicted: list[str] = Field(
+        default_factory=list,
+        description="Statements in the claim that the evidence contradicts, quoted briefly.",
+    )
+    corrections: list[str] = Field(
+        default_factory=list,
+        description="Specific edits for the report writer; empty if the claim is fine.",
+    )
+
+
+class ReviewDraft(_Model):
+    """The reviewer model's answer: one review per claim."""
+
+    reviews: list[ClaimReview]
+
+
+class RevisionItem(_Model):
+    item_id: str
+    claim: str
+    corrections: list[str]
+    verifier_evidence: list[ReviewEvidence]
+    investigation_summary: str | None
+
+
+class RevisionInput(_Model):
+    items: list[RevisionItem]
+
+
+class RevisedClaim(_Model):
+    item_id: str
+    claim: str = Field(description="The corrected claim, one or two sentences in English.")
+
+
+class RevisionDraft(_Model):
+    """The report writer's rewrite of the claims the reviewer asked to correct."""
+
+    claims: list[RevisedClaim]
+
+
+class ReviewRound(_Model):
+    """One pass of the critic loop: the reviews, and which claims were then rewritten."""
+
+    round: int = Field(ge=1)
+    reviews: list[ClaimReview]
+    revised_item_ids: list[str] = Field(default_factory=list)
+
+
 class SiteRun(_Model):
     """Everything the pipeline produced for one site, for auditing and evals."""
 
@@ -458,4 +561,36 @@ class PipelineResult(_Model):
 
     brief: RiskBrief
     site_runs: list[SiteRun]
+    investigations: list[Investigation] = Field(default_factory=list)
+    review_rounds: list[ReviewRound] = Field(default_factory=list)
     model_calls: dict[str, int] = Field(description="Model calls per agent name.")
+
+
+# ---------------------------------------------------------------------------
+# Root agent
+# ---------------------------------------------------------------------------
+
+
+class RootRequest(_Model):
+    """A plain-language question for the root agent."""
+
+    question: str = Field(min_length=1)
+    today: date
+
+
+class RootAnswer(_Model):
+    """The root agent's answer. The brief itself is attached by Python, not retyped."""
+
+    summary: str = Field(description="Two to four sentences answering the question.")
+    rationale: str = Field(description="One sentence: why these sites and dates.")
+    site_ids: list[str]
+    start_date: date
+    end_date: date
+
+
+class RootResult(_Model):
+    answer: RootAnswer
+    pipeline: PipelineResult | None = Field(
+        default=None, description="The brief and its detail, if the pipeline ran."
+    )
+    model_calls: dict[str, int]

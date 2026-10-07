@@ -1,22 +1,25 @@
-"""Investigator: an ADK agent with tools that checks high-risk and unverifiable findings.
+"""Investigator: an ADK agent with tools that checks high-risk claims and unverifiable stories.
 
-Runs only for findings scored risk >= ``RISK_THRESHOLD`` (severity x impact) or marked
-"unverifiable". It looks for corroborating sources, checks whether the disruption is
-ongoing or resolved, and returns a short evidence summary with a confidence level.
+Runs once per story, after the report writer has merged findings into claims:
+    investigate_claim   a brief claim with risk >= ``RISK_THRESHOLD`` (severity x impact),
+                        however many findings it was built from
+    investigate_story   a story the verifier marked "unverifiable"
+It looks for corroborating sources, checks whether the disruption is ongoing or resolved,
+and returns a short evidence summary with a confidence level.
 
-Tools (closures over one finding, so state never leaks between findings):
+Tools (closures over one story, so state never leaks between stories):
     search_news(keywords, this_site_only)  guarded keyword search of scrm.gkg_near_sites
                                            and scrm.events_near_sites via BigQueryTool:
                                            fixed SQL, keywords passed as parameters
     read_article(result_id)                fetch an article by result ID
 
-The model never handles URLs: search results come back as R1, R2, ... and the finding's
-own article is F0. Python maps cited IDs back to URLs, and read_article can only fetch
-pages the search returned. A before_tool_callback caps the agent at ``MAX_TOOL_CALLS``
-tool calls per finding and logs every call (run ID included via the bound RunContext);
+The model never handles URLs: the story's own sources are F1, F2, ... and search results
+come back as R1, R2, .... Python maps cited IDs back to URLs, and read_article can only
+fetch those pages. A before_tool_callback caps the agent at ``MAX_TOOL_CALLS`` tool calls
+per story and logs every call (run ID included via the bound RunContext);
 ``max_llm_calls`` is a hard backstop.
 
-Input:  InvestigatorInput (built from a verified event, its score and the run's dates)
+Input:  InvestigatorInput (a claim and its sources, or one unverifiable story)
 Output: Investigation
 """
 
@@ -37,12 +40,14 @@ from scrm.agents._adk import run_structured
 from scrm.config import Settings, get_settings
 from scrm.schemas import (
     Article,
+    BriefItem,
     FetchFailure,
     Investigation,
     InvestigationJudgement,
     InvestigatorInput,
-    RiskScore,
+    InvestigatorSource,
     Site,
+    Verdict,
     VerifiedEvent,
 )
 from scrm.telemetry import get_logger
@@ -65,10 +70,11 @@ LOOKBACK_DAYS = 7  # search from a week before the finding, up to the end of the
 log = get_logger(__name__)
 
 INSTRUCTION = f"""\
-You investigate one finding for a supply chain risk team. The input is JSON with a
-monitored site and a finding: what the verifier concluded (verdict, scope, reason, quote),
-its risk scores if any, the date, and the last date you may search (search_until).
-Findings are either high risk or "unverifiable" (the source article could not be read).
+You investigate one story for a supply chain risk team. The input is JSON with a
+monitored site, the subject ("claim": a high-risk claim from the brief, or
+"unverifiable_story": a story whose article could not be read), the claim text, the
+story's own sources F1, F2, ... (with what the verifier concluded: verdict, scope, reason,
+quote, date), risk scores if any, and the last date you may search (search_until).
 
 Your job:
 1. Corroborate: find other, independent reports of the same disruption.
@@ -80,14 +86,15 @@ Tools (at most {MAX_TOOL_CALLS} calls in total, so plan them):
   Use 2-4 distinctive words likely to appear in headlines or organisation names, in the
   language of local coverage when useful (e.g. "haven staking" for Dutch). Results come
   back newest first as IDs R1, R2, ... with headline words, source, date and place.
-- read_article(result_id): read an article by ID. F0 is the finding's own article.
+- read_article(result_id): read an article by ID: the story's own sources (F1, F2, ...)
+  or search results (R1, R2, ...).
 
 Return:
 - summary: at most three sentences in English with what the evidence shows.
 - status: "ongoing", "resolved" or "unclear".
 - confidence: "high" (several independent reports agree and are recent), "medium" (some
   support), or "low" (little or conflicting evidence).
-- corroborating_ids: IDs of results that independently support the finding (not F0).
+- corroborating_ids: search result IDs (R...) that independently support the story.
 Base everything on what the tools returned; never invent sources or facts.
 """
 
@@ -169,7 +176,7 @@ class Toolkit:
 
     tool: BigQueryTool
     site: Site
-    event_id: str
+    subject_id: str  # item ID of a claim, or event ID of an unverifiable story
     start: date
     end: date
     fetch: Fetcher = fetch_article
@@ -185,7 +192,7 @@ class Toolkit:
         log.info(
             "investigator.tool_call",
             extra={
-                "event_id": self.event_id,
+                "subject_id": self.subject_id,
                 "call": self.calls,
                 "tool": tool.name,
                 "tool_args": args,
@@ -263,7 +270,7 @@ class Toolkit:
 
 
 def build_agent(settings: Settings, toolkit: Toolkit) -> LlmAgent:
-    """Return the agent for one finding. Constructing it makes no network calls."""
+    """Return the agent for one story. Constructing it makes no network calls."""
     return LlmAgent(
         name=NAME,
         model=settings.gemini_model,
@@ -282,10 +289,9 @@ def build_agent(settings: Settings, toolkit: Toolkit) -> LlmAgent:
 # --------------------------------------------------------------------------------------
 
 
-def needs_investigation(verified: VerifiedEvent, score: RiskScore | None) -> bool:
-    if verified.verdict.value == "unverifiable":
-        return True
-    return score is not None and score.severity * score.impact >= RISK_THRESHOLD
+def needs_investigation(item: BriefItem) -> bool:
+    """A claim is investigated when its risk (severity x impact) reaches the threshold."""
+    return item.risk >= RISK_THRESHOLD
 
 
 Investigate = Callable[[InvestigatorInput, Toolkit], Awaitable[InvestigationJudgement]]
@@ -299,9 +305,21 @@ async def _gemini_investigate(
     return await run_structured(agent, payload, InvestigationJudgement, run_config=config)
 
 
-async def run(
-    verified: VerifiedEvent,
-    score: RiskScore | None,
+def _source(source_id: str, verified: VerifiedEvent) -> InvestigatorSource:
+    return InvestigatorSource(
+        source_id=source_id,
+        title=verified.event.title,
+        event_date=verified.event.event_date,
+        verdict=verified.verdict,
+        scope=verified.scope,
+        reason=verified.reason,
+        quote=verified.quote,
+    )
+
+
+async def investigate_claim(
+    item: BriefItem,
+    events: list[VerifiedEvent],
     site: Site,
     search_until: date,
     tool: BigQueryTool,
@@ -309,35 +327,91 @@ async def run(
     investigate: Investigate = _gemini_investigate,
     fetch: Fetcher = fetch_article,
 ) -> Investigation | None:
-    """Investigate one finding. Returns None if the investigation itself failed.
+    """Investigate one brief claim built from ``events`` (its verified sources)."""
+    return await _run(
+        subject="claim",
+        subject_id=item.item_id or "claim",
+        claim=item.claim,
+        events=events,
+        severity=item.severity,
+        impact=item.impact,
+        site=site,
+        search_until=search_until,
+        tool=tool,
+        investigate=investigate,
+        fetch=fetch,
+        item_id=item.item_id,
+    )
+
+
+async def investigate_story(
+    verified: VerifiedEvent,
+    site: Site,
+    search_until: date,
+    tool: BigQueryTool,
+    *,
+    investigate: Investigate = _gemini_investigate,
+    fetch: Fetcher = fetch_article,
+) -> Investigation | None:
+    """Investigate one story the verifier could not judge ("unverifiable")."""
+    if verified.verdict is not Verdict.UNVERIFIABLE:
+        raise ValueError("investigate_story is for unverifiable stories")
+    return await _run(
+        subject="unverifiable_story",
+        subject_id=verified.event.event_id,
+        claim=verified.event.title or "Untitled story; the article could not be read.",
+        events=[verified],
+        severity=None,
+        impact=None,
+        site=site,
+        search_until=search_until,
+        tool=tool,
+        investigate=investigate,
+        fetch=fetch,
+        event_id=verified.event.event_id,
+    )
+
+
+async def _run(
+    *,
+    subject: Literal["claim", "unverifiable_story"],
+    subject_id: str,
+    claim: str,
+    events: list[VerifiedEvent],
+    severity: int | None,
+    impact: int | None,
+    site: Site,
+    search_until: date,
+    tool: BigQueryTool,
+    investigate: Investigate,
+    fetch: Fetcher,
+    item_id: str | None = None,
+    event_id: str | None = None,
+) -> Investigation | None:
+    """Shared body: build the toolkit and input, run the agent, map IDs back to URLs.
 
     Call inside ``ctx.bind()`` so every tool-call log line carries the run ID.
+    Returns None if the investigation itself failed.
     """
-    event = verified.event
-    trigger: Literal["high_risk", "unverifiable"] = (
-        "unverifiable" if verified.verdict.value == "unverifiable" else "high_risk"
-    )
+    sources = {f"F{n}": v for n, v in enumerate(events, 1)}
+    earliest = min(v.event.event_date for v in events)
     toolkit = Toolkit(
         tool=tool,
         site=site,
-        event_id=event.event_id,
-        start=event.event_date - timedelta(days=LOOKBACK_DAYS),
+        subject_id=subject_id,
+        start=earliest - timedelta(days=LOOKBACK_DAYS),
         end=search_until,
         fetch=fetch,
-        results={"F0": str(verified.evidence_url)},
+        results={sid: str(v.evidence_url) for sid, v in sources.items()},
     )
     payload = InvestigatorInput(
         site=site,
-        finding_id="F0",
-        title=event.title,
-        event_date=event.event_date,
+        subject=subject,
+        claim=claim,
+        sources=[_source(sid, v) for sid, v in sources.items()],
         search_until=search_until,
-        verdict=verified.verdict,
-        scope=verified.scope,
-        reason=verified.reason,
-        quote=verified.quote,
-        severity=score.severity if score else None,
-        impact=score.impact if score else None,
+        severity=severity,
+        impact=impact,
     )
     hit_limit = False
     try:
@@ -350,30 +424,33 @@ async def run(
             confidence="low",
         )
     except Exception:
-        log.exception("investigator.failed", extra={"event_id": event.event_id})
+        log.exception("investigator.failed", extra={"subject_id": subject_id})
         return None
+    own = {str(v.evidence_url) for v in events}
     cited = [toolkit.results[i] for i in judgement.corroborating_ids if i in toolkit.results]
     unknown = [i for i in judgement.corroborating_ids if i not in toolkit.results]
     if unknown:
-        log.warning("investigator.unknown_ids", extra={"event_id": event.event_id, "ids": unknown})
-    own = str(verified.evidence_url)
+        log.warning("investigator.unknown_ids", extra={"subject_id": subject_id, "ids": unknown})
+    source_urls = [v.evidence_url for v in events]
     result = Investigation(
-        event_id=event.event_id,
+        item_id=item_id,
+        event_id=event_id,
         site_id=site.site_id,
-        source_url=verified.evidence_url,
-        trigger=trigger,
+        source_url=source_urls[0],
+        source_urls=source_urls,
+        trigger="high_risk" if subject == "claim" else "unverifiable",
         summary=judgement.summary,
         status=judgement.status,
         confidence=judgement.confidence,
-        corroborating_urls=list(dict.fromkeys(u for u in cited if u != own)),
+        corroborating_urls=list(dict.fromkeys(u for u in cited if u not in own)),
         tool_calls=min(toolkit.calls, MAX_TOOL_CALLS),
         hit_limit=hit_limit or toolkit.refused > 0,
     )
     log.info(
         "investigator.done",
         extra={
-            "event_id": event.event_id,
-            "trigger": trigger,
+            "subject_id": subject_id,
+            "subject": subject,
             "status": result.status,
             "confidence": result.confidence,
             "corroborating": len(result.corroborating_urls),

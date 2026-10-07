@@ -7,23 +7,64 @@ for events that could disrupt a fictional laptop maker's 22 sites (12 suppliers,
 readability and best practice beat feature count. Stack: Python 3.12, uv, Google ADK,
 Gemini on Gemini Enterprise Agent Platform (formerly Vertex AI), BigQuery, Pydantic v2, FastAPI.
 
-Pipeline (`src/scrm/agents/`), run by `orchestrator` (plain Python, sites in parallel):
-1. `query_agent`: fixed, parameterised SQL over `scrm.*` tables (no LLM). Two retrieval
-   paths: location (inside the site's radius) and entity (names the site's company but
-   geocoded near another site). Ranks (`ranking.py`), clusters stories (`clustering.py`),
-   returns up to 50 -> `QueryResult`
-2. `entity_resolver`: deterministic alias table (`SITE_ALIASES`) + whole-word matching of
-   GDELT organisations to each site's company/operator; feeds retrieval and ranking
-3. `triage`: one LlmAgent call per site over candidate metadata (no URLs); picks stories
-   plausibly about a disruption, one-line reason each -> `TriageResult`
-4. `verifier`: reads one article per triaged story; rubric direct / indirect /
-   not_relevant / unverifiable, verbatim quote -> `VerifiedEvent` (verdict + scope)
-5. `risk_scorer`: severity and impact 1-5 with a one-sentence reason, "yes" only -> `RiskScore`
-6. `investigator`: LlmAgent with tools (guarded scrm search, article fetch) for findings with
-   risk >= 12 or unverifiable; corroboration, ongoing/resolved, confidence -> `Investigation`
-7. `report_writer`: one brief: direct findings, then indirect, then investigated
-   unverifiable stories; ordered by risk (severity x impact) -> `RiskBrief`
-`orchestrator.run_pipeline` returns `PipelineResult` (brief + per-site detail + model calls).
+Pipeline (`src/scrm/agents/`), run by `orchestrator` (plain Python). Per site, in parallel:
+1. `query_agent`: fixed, parameterised SQL over `scrm.*` (no LLM). Location path (inside
+   the radius) + entity path (names the site's company, geocoded near another site).
+   Ranks (`ranking.py`), clusters stories (`clustering.py`), returns up to 50
+2. `entity_resolver`: deterministic alias table (`SITE_ALIASES`) + whole-word org matching
+3. `triage`: one LlmAgent call per site over candidate metadata (no URLs) -> `TriageResult`
+4. `verifier`: one article per triaged story; direct / indirect / not_relevant /
+   unverifiable with a verbatim quote -> `VerifiedEvent` (verdict + scope)
+5. `risk_scorer`: severity and impact 1-5 with a one-sentence reason -> `RiskScore`
+Then once, for all sites:
+6. `report_writer.draft_items`: merges findings into claims I1, I2, ... -> `BriefItem`s
+7. `investigator`: LlmAgent + tools (guarded scrm search, article fetch), once per claim
+   with risk >= 12 and once per unverifiable story -> `Investigation`
+8. `reviewer`: critic loop; checks claims against verifier evidence and investigations,
+   sends corrections to `report_writer.revise_items` (at most 2 rounds), sets status and
+   confidence on every claim -> `ReviewRound`s
+9. `report_writer.render`: direct, indirect, investigated unverifiable stories -> `RiskBrief`
+`orchestrator.run_pipeline` returns `PipelineResult` (brief, per-site detail,
+investigations, review rounds, model calls per agent). `root_agent` (LlmAgent with
+`list_sites` and `run_risk_brief` tools) turns a plain-language question into sites and
+dates, runs the pipeline once and answers; Python attaches the brief (`RootResult`).
+
+```mermaid
+flowchart TD
+    Q["Plain-language question<br/>'What are the risks to our chip supply this week?'"] --> ROOT
+    ROOT["root_agent (LLM)<br/>chooses sites and dates"] -->|list_sites| SITES[(scrm.sites)]
+    ROOT -->|run_risk_brief, once| ORCH
+    REQ["BriefRequest<br/>(scripts/run_brief.py, POST /brief)"] --> ORCH
+    ORCH["orchestrator<br/>plain Python, one run ID"]
+
+    subgraph PER_SITE["Per site, sites in parallel"]
+        direction TB
+        QA["query_agent<br/>fixed SQL, no LLM"] --> TRI["triage (LLM)<br/>1 call per site"]
+        ER["entity_resolver<br/>company aliases"] -. second retrieval path .-> QA
+        TRI --> VER["verifier (LLM)<br/>direct / indirect /<br/>not relevant / unverifiable"]
+        VER --> RS["risk_scorer (LLM)<br/>severity x impact"]
+    end
+
+    ORCH --> QA
+    QA --> BQ[(BigQuery: scrm.gkg_near_sites,<br/>scrm.events_near_sites)]
+
+    subgraph ONCE["Once, all sites together"]
+        direction TB
+        DRAFT["report_writer (LLM)<br/>drafts claims I1, I2, ..."] --> INV["investigator (LLM + tools)<br/>once per claim with risk >= 12<br/>and per unverifiable story"]
+        INV --> REV{"reviewer (LLM)<br/>claims vs evidence"}
+        REV -->|corrections, at most 2 rounds| FIX["report_writer (LLM)<br/>revises flagged claims"]
+        FIX --> REV
+        REV -->|status + confidence| RENDER["render (Python)<br/>direct, indirect,<br/>unverifiable, coverage"]
+    end
+
+    RS --> DRAFT
+    VER -->|unverifiable stories| INV
+    INV <-->|"search_news (guarded SQL), read_article"| TOOLS[(scrm tables, news sites)]
+    RENDER --> BRIEF["RiskBrief: every claim linked,<br/>status and confidence on each"]
+    BRIEF --> ROOT
+    BRIEF --> RUN[(data/runs/run_id.json)]
+    RUN -. add_eval_cases .-> EVALS[(evals/dataset.jsonl)]
+```
 
 ## Commands
 - Install: `uv sync`
@@ -39,6 +80,7 @@ Pipeline (`src/scrm/agents/`), run by `orchestrator` (plain Python, sites in par
 - Brief (calls Gemini and BigQuery):
   `uv run --env-file .env python scripts/run_brief.py --sites P05 S01 C01 P02 --days 30 [--end YYYY-MM-DD] [--compare RUN_ID]`
   (saves the full result to `data/runs/<run_id>.json`, gitignored)
+- Ask the root agent: `uv run --env-file .env python scripts/ask.py "What are the risks to our chip supply this week?"`
 - BigQuery smoke test: `uv run --env-file .env python scripts/check_bigquery.py`
 - Export scrm tables to Parquet (`data/*.parquet`, gitignored; checks row counts):
   `uv run --env-file .env python scripts/export_parquet.py`
@@ -57,7 +99,10 @@ Pipeline (`src/scrm/agents/`), run by `orchestrator` (plain Python, sites in par
 - A "yes" verdict needs a quote found verbatim in the article; otherwise "unverifiable".
 - Agent tools never take SQL or URLs from the model: the investigator's search runs fixed,
   parameterised SQL through `BigQueryTool`; results come back as IDs (R1..., F0) and only
-  those can be fetched or cited. Tool calls are capped (8 per finding) and logged.
+  those can be fetched or cited. Tool calls are capped (investigator 8 per story, root
+  agent 4 per question, pipeline at most once per question) and logged.
+- The reviewer and report writer cite claims by ID; revisions may change claim text only,
+  never sources, scope or scores.
 - Never rewrite `evals/dataset.jsonl` while human labels may be in progress; append only
   (`scripts/add_eval_cases.py`). Human labels are never overwritten by code.
 - Logging is structured JSON (`scrm.telemetry`). Every agent takes a `RunContext`, and
@@ -107,12 +152,23 @@ Pipeline (`src/scrm/agents/`), run by `orchestrator` (plain Python, sites in par
       (same window): verifier calls 65 -> 39, rejection rate 85% -> 49% (P05 65% -> 12%,
       C01 78% -> 7%, S01 100% -> 100% (14/14), P02 100% -> 100% (3/3))
 - [x] Verifier rubric direct / indirect / not_relevant; brief leads with direct findings
-- [x] `investigator` (LlmAgent + guarded search and fetch tools, 8 tool calls per finding)
-- [ ] Investigator cost: 112 of 176 model calls in run 10e2cf2f2b0a, six of them on C01
-      findings the report writer merged into one claim. Investigate once per story or
-      per brief item instead of per finding
+- [x] `investigator` (LlmAgent + guarded search and fetch tools, 8 tool calls per story)
+- [x] Investigate once per story, after findings are merged into claims. Run 11ad747002b1 vs
+      10e2cf2f2b0a (same window): investigations 13 -> 7, investigator calls 112 -> 57,
+      total model calls 176 -> 108
+- [x] `reviewer` critic loop (at most 2 revision rounds); every claim shows status and
+      confidence. In run 65381870a2f6 it caught a claim tying a storm warning to Hsinchu
+      that the quote did not support, and the writer removed it
+- [x] `root_agent`: plain-language question -> sites and dates -> pipeline as a tool ->
+      answer with the brief attached (`scripts/ask.py`). "Chip supply this week" chose
+      S01, S07, S09, S11 for 2026-10-01..07; 30 model calls
+- [ ] Reviewer only sees the investigator's summary, not the corroborating articles: in run
+      11ad747002b1 the C01 claim says Suez traffic is falling while one corroborating link
+      says traffic returned to normal. Pass short excerpts of cited articles to the reviewer
+- [ ] Investigator results vary between runs (the S01 Hsinchu story: "a drill, resolved"
+      in one run, "unclear, nothing found" in the next). Consider two samples or caching
 - [ ] Verifier with the rubric may be lenient on "indirect" for chokepoints: C01 confirmed
-      13 of 14 (Houthi advances, a Saudi pipeline shutdown). Label the C01 cases first
+      12 of 12 judged in run 11ad747002b1. Label the C01 cases first
 - [ ] S01 still has no confirmed disruption: the entity path finds TSMC mentions, mostly
       market news, and triage passes 16 of which 14 are rejected. Tighten triage for
       company-only matches; add factory themes to ranking

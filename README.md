@@ -13,25 +13,54 @@ The demo company is a fictional laptop maker with 22 real sites: 12 supplier fac
 
 ## How it works
 
-```
-BriefRequest(sites, dates)
-  per site, in parallel:
-  -> query_agent       SQL over scrm.* tables (dry-run guarded): nearby articles plus
-                       articles naming the site's company (entity_resolver); ranked,
-                       same-story articles clustered                    -> Event[] (top 50)
-  -> triage            one model call: which stories could be a disruption here
-  -> verifier          reads one article per story: direct / indirect /
-                       not relevant, with a verbatim quote              -> VerifiedEvent[]
-  -> risk_scorer       severity and impact, 1 to 5, with a reason      -> RiskScore[]
-  -> investigator      agent with search and fetch tools; corroborates
-                       risk >= 12 and unverifiable findings             -> Investigation[]
-  then once:
-  -> report_writer     one Markdown brief: direct, then indirect, then
-                       investigated unverifiable; a source on every claim -> RiskBrief
+```mermaid
+flowchart TD
+    Q["Plain-language question<br/>'What are the risks to our chip supply this week?'"] --> ROOT
+    ROOT["root_agent (LLM)<br/>chooses sites and dates"] -->|list_sites| SITES[(scrm.sites)]
+    ROOT -->|run_risk_brief, once| ORCH
+    REQ["BriefRequest<br/>(scripts/run_brief.py, POST /brief)"] --> ORCH
+    ORCH["orchestrator<br/>plain Python, one run ID"]
+
+    subgraph PER_SITE["Per site, sites in parallel"]
+        direction TB
+        QA["query_agent<br/>fixed SQL, no LLM"] --> TRI["triage (LLM)<br/>1 call per site"]
+        ER["entity_resolver<br/>company aliases"] -. second retrieval path .-> QA
+        TRI --> VER["verifier (LLM)<br/>direct / indirect /<br/>not relevant / unverifiable"]
+        VER --> RS["risk_scorer (LLM)<br/>severity x impact"]
+    end
+
+    ORCH --> QA
+    QA --> BQ[(BigQuery: scrm.gkg_near_sites,<br/>scrm.events_near_sites)]
+
+    subgraph ONCE["Once, all sites together"]
+        direction TB
+        DRAFT["report_writer (LLM)<br/>drafts claims I1, I2, ..."] --> INV["investigator (LLM + tools)<br/>once per claim with risk >= 12<br/>and per unverifiable story"]
+        INV --> REV{"reviewer (LLM)<br/>claims vs evidence"}
+        REV -->|corrections, at most 2 rounds| FIX["report_writer (LLM)<br/>revises flagged claims"]
+        FIX --> REV
+        REV -->|status + confidence| RENDER["render (Python)<br/>direct, indirect,<br/>unverifiable, coverage"]
+    end
+
+    RS --> DRAFT
+    VER -->|unverifiable stories| INV
+    INV <-->|"search_news (guarded SQL), read_article"| TOOLS[(scrm tables, news sites)]
+    RENDER --> BRIEF["RiskBrief: every claim linked,<br/>status and confidence on each"]
+    BRIEF --> ROOT
+    BRIEF --> RUN[(data/runs/run_id.json)]
+    RUN -. add_eval_cases .-> EVALS[(evals/dataset.jsonl)]
 ```
 
-The `orchestrator` runs these steps as plain Python and gives each run a run ID that
-appears in every log line, so one brief can be traced end to end.
+The `orchestrator` runs the pipeline as plain Python: per site (in parallel) it retrieves
+and ranks candidate stories, triages them, verifies the chosen ones by reading the article,
+and scores confirmed disruptions. Then, for all sites at once, the report writer drafts
+claims, the investigator checks each high-risk claim and each unverifiable story once,
+and a reviewer critic loop corrects the claims (at most two rounds) and sets each claim's
+status and confidence before the brief is rendered. Every run has one run ID on every
+log line, so a brief can be traced end to end.
+
+The `root_agent` sits on top: it turns a plain-language question into sites and dates,
+runs the pipeline as a tool, and answers with the brief attached
+(`uv run --env-file .env python scripts/ask.py "What are the risks to our chip supply this week?"`).
 
 Built with [Google ADK](https://adk.dev/), Gemini on Gemini Enterprise Agent Platform
 (formerly Vertex AI), BigQuery, Pydantic v2 and FastAPI.
@@ -42,6 +71,10 @@ Built with [Google ADK](https://adk.dev/), Gemini on Gemini Enterprise Agent Pla
   configurable byte limit (default 10 GiB). It is also refused if it touches a table outside
   the `scrm` dataset or is anything other than a `SELECT`.
 - **Structured output only.** Every agent returns a Pydantic model, never free text.
+- **Models never handle URLs.** Agents see and cite IDs (findings, search results, claims);
+  Python maps them back to sources, so a model cannot invent or alter a link.
+- **Bounded agents.** Tool-using agents run fixed, parameterised queries through the cost
+  guard, have per-task tool-call caps and log every call.
 - **Citations are enforced by validation.** A `RiskBrief` whose Markdown omits a source URL
   fails validation.
 - **No keys.** Authentication uses Application Default Credentials only.

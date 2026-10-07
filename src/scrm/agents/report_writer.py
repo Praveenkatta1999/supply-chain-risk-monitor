@@ -1,15 +1,18 @@
-"""Report writer: produces the daily risk brief in Markdown with source links.
+"""Report writer: drafts the brief's claims, revises them on request, renders the Markdown.
 
-Gemini drafts the claims (``ReportDraft``): it merges findings about the same event and
-writes each as a short English sentence citing the findings it used. Python then
-maps the cited finding IDs back to their verified URLs (the model never handles URLs),
-attaches risk scores and supporting URLs, orders items by risk (severity x impact) and
-renders the Markdown itself, so each claim carries its links by construction. If a draft
-item is invalid or a finding goes uncited, the verifier's reason is used as the claim.
-RiskBrief validation re-checks the links.
+Three steps, so the orchestrator can investigate and review claims in between:
+    draft_items    Gemini merges findings about the same event into claims (``ReportDraft``)
+                   citing finding IDs; Python maps IDs back to verified URLs (the model
+                   never handles URLs), attaches scores and supporting URLs, numbers the
+                   claims I1, I2, ... If a draft item is invalid or a finding goes uncited,
+                   the verifier's reason is used as the claim.
+    revise_items   Gemini rewrites only the claims the reviewer corrected; sources, scope
+                   and scores stay as they are.
+    render         Python renders the Markdown, so each claim carries its links by
+                   construction; RiskBrief validation re-checks them.
 
 Only "yes" verdicts become claims; rejected and unverifiable candidates are counted in
-the brief's coverage line but never stated as facts.
+the coverage table but never stated as facts.
 
 Input:  ReportRequest
 Output: RiskBrief
@@ -30,6 +33,9 @@ from scrm.schemas import (
     ReportDraft,
     ReportDraftInput,
     ReportRequest,
+    RevisionDraft,
+    RevisionInput,
+    RevisionItem,
     RiskBrief,
     Scope,
     Site,
@@ -76,11 +82,44 @@ def build_agent(settings: Settings) -> LlmAgent:
     )
 
 
+REVISION_INSTRUCTION = """\
+You revise claims in a supply chain risk brief after a reviewer checked them against the
+evidence. The input is JSON with the claims to fix: each has an item_id, the current
+claim, the reviewer's corrections, the verifier's evidence (reasons and verbatim quotes)
+and the investigator's summary if there is one.
+
+For each claim, apply every correction:
+- remove statements the corrections say are resolved or contradicted;
+- keep only facts supported by the evidence; do not add new numbers, dates or causes;
+- keep it to one or two plain English sentences about what is happening at or near the
+  site and why it matters.
+Return claims: one entry per item_id you were given, with the corrected claim.
+"""
+
+
+def build_revision_agent(settings: Settings) -> LlmAgent:
+    """The same report writer, asked to correct claims. Constructing it makes no calls."""
+    return LlmAgent(
+        name=NAME,
+        model=settings.gemini_model,
+        description="Report writer, revising claims on the reviewer's corrections.",
+        instruction=REVISION_INSTRUCTION,
+        input_schema=RevisionInput,
+        output_schema=RevisionDraft,
+        output_key=NAME,
+    )
+
+
 Drafter = Callable[[ReportDraftInput], Awaitable[ReportDraft]]
+Reviser = Callable[[RevisionInput], Awaitable[RevisionDraft]]
 
 
 async def _gemini_draft(payload: ReportDraftInput) -> ReportDraft:
     return await run_structured(build_agent(get_settings()), payload, ReportDraft)
+
+
+async def _gemini_revise(payload: RevisionInput) -> RevisionDraft:
+    return await run_structured(build_revision_agent(get_settings()), payload, RevisionDraft)
 
 
 Evidence = dict[str, tuple[Finding, VerifiedEvent]]  # finding_id -> (finding, event)
@@ -126,7 +165,7 @@ def _brief_item(site_id: str, claim: str, cited: list[tuple[Finding, VerifiedEve
 
 
 def items_from_draft(draft: ReportDraft, evidence: Evidence) -> list[BriefItem]:
-    """Turn draft items into brief items, ordered by risk (highest first).
+    """Turn draft items into brief items, ordered by risk (highest first), IDs I1, I2, ...
 
     A draft item citing an unknown finding ID, or a finding from another site, is dropped.
     Any confirmed finding left uncited then gets its own item, worded by the verifier's
@@ -147,7 +186,44 @@ def items_from_draft(draft: ReportDraft, evidence: Evidence) -> list[BriefItem]:
                 "report.finding_uncited", extra={"finding_id": fid, "url": str(event.evidence_url)}
             )
             items.append(_brief_item(finding.site_id, finding.reason, [(finding, event)]))
-    return sorted(items, key=lambda i: i.risk, reverse=True)
+    ordered = sorted(items, key=lambda i: i.risk, reverse=True)
+    return [item.model_copy(update={"item_id": f"I{n}"}) for n, item in enumerate(ordered, 1)]
+
+
+def apply_revisions(
+    items: list[BriefItem], revision: RevisionDraft, asked: set[str]
+) -> list[BriefItem]:
+    """Replace the claim text of items the reviewer corrected; nothing else changes."""
+    new_text = {
+        c.item_id: c.claim.strip()
+        for c in revision.claims
+        if c.item_id in asked and c.claim.strip()
+    }
+    if ignored := sorted({c.item_id for c in revision.claims} - set(new_text)):
+        log.warning("report.revision_ignored", extra={"item_ids": ignored})
+    return [
+        item.model_copy(update={"claim": new_text[item.item_id], "revisions": item.revisions + 1})
+        if item.item_id in new_text
+        else item
+        for item in items
+    ]
+
+
+async def revise_items(
+    items: list[BriefItem],
+    requests: list[RevisionItem],
+    ctx: RunContext,
+    *,
+    revise: Reviser = _gemini_revise,
+) -> list[BriefItem]:
+    """Ask the report writer to apply the reviewer's corrections to the given claims."""
+    if not requests:
+        return items
+    with ctx.bind():
+        revision = await revise(RevisionInput(items=requests))
+        revised = apply_revisions(items, revision, {r.item_id for r in requests})
+        log.info("report.revised", extra={"item_ids": [r.item_id for r in requests]})
+        return revised
 
 
 def _links(urls: list, label: str) -> str:
@@ -164,25 +240,34 @@ def _investigation_line(inv: Investigation) -> str:
     return line
 
 
+def _item_investigations(
+    item: BriefItem, investigations: list[Investigation]
+) -> list[Investigation]:
+    """The investigation of this claim (by item ID), or, for older runs, of its sources."""
+    by_item = [i for i in investigations if i.item_id and i.item_id == item.item_id]
+    if by_item:
+        return by_item
+    sources = {str(u) for u in item.source_urls}
+    return [i for i in investigations if not i.item_id and str(i.source_url) in sources]
+
+
 def _render_item(
-    rank: int, item: BriefItem, site: Site, investigations: dict[str, Investigation]
+    rank: int, item: BriefItem, site: Site, investigations: list[Investigation]
 ) -> list[str]:
     score = (
-        f"severity {item.severity}, impact {item.impact}, risk {item.risk}/25"
+        f"risk {item.risk}/25: severity {item.severity}, impact {item.impact}"
         if item.severity
         else "unscored"
     )
+    reviewed = f" · {item.status} · {item.confidence} confidence" if item.status else ""
     lines = [
-        f"{rank}. **{site.site_id} {site.site_name}** ({score})",
+        f"{rank}. **{site.site_id} {site.site_name}** ({score}){reviewed}",
         f"   {item.claim} ({_links(item.source_urls, 'source')})",
     ]
+    lines += [f"   Contradicted by the evidence: {c}" for c in item.contradictions]
     if item.supporting_urls:
         lines.append(f"   Also reported, not verified: {_links(item.supporting_urls, 'link')}")
-    lines += [
-        _investigation_line(investigations[str(url)])
-        for url in item.source_urls
-        if str(url) in investigations
-    ]
+    lines += [_investigation_line(i) for i in _item_investigations(item, investigations)]
     return lines
 
 
@@ -232,12 +317,14 @@ def _section(
     title: str,
     items: list[BriefItem],
     sites: dict[str, Site],
-    investigations: dict[str, Investigation],
+    investigations: list[Investigation],
 ) -> list[str]:
     lines = ["", f"## {title}", ""]
     if not items:
         return [*lines, "None in this period."]
-    for rank, item in enumerate(items, 1):
+    # Highest risk first, but resolved disruptions after everything still live.
+    ordered = sorted(items, key=lambda i: (i.status == "resolved", -i.risk))
+    for rank, item in enumerate(ordered, 1):
         lines += _render_item(rank, item, sites[item.site_id], investigations)
     return lines
 
@@ -245,14 +332,15 @@ def _section(
 def render_markdown(request: ReportRequest, items: list[BriefItem], generated_at: datetime) -> str:
     dr = request.date_range
     sites = {s.site_id: s for s in request.sites}
-    investigations = {str(i.source_url): i for i in request.investigations}
+    investigations = request.investigations
     direct = [i for i in items if i.scope is not Scope.INDIRECT]  # includes legacy None
     indirect = [i for i in items if i.scope is Scope.INDIRECT]
     lines = [
         f"# Supply chain risk brief: {dr.start} to {dr.end}",
         "",
         f"Run `{request.run_id}`, generated {generated_at:%Y-%m-%d %H:%M} UTC. "
-        f"Sites: {', '.join(sites)}. Risk = severity x impact, each 1-5, highest first.",
+        f"Sites: {', '.join(sites)}. Risk = severity x impact, each 1-5, highest first; "
+        "status and confidence come from the reviewer.",
         *_section("Direct disruptions: the site itself", direct, sites, investigations),
         *_section(
             "Indirect disruptions: connected routes and regions", indirect, sites, investigations
@@ -267,29 +355,44 @@ def render_markdown(request: ReportRequest, items: list[BriefItem], generated_at
     return "\n".join(lines) + "\n"
 
 
-async def run(
+async def draft_items(
     request: ReportRequest, ctx: RunContext, *, draft: Drafter = _gemini_draft
-) -> RiskBrief:
-    """Write the brief for one run within ``ctx.run_id``."""
+) -> list[BriefItem]:
+    """Draft the brief's claims from the confirmed findings (one model call)."""
     with ctx.bind():
         evidence = gather_evidence(request)
         log.info("report.start", extra={"findings": len(evidence)})
-        items: list[BriefItem] = []
-        if evidence:
-            payload = ReportDraftInput(
-                date_range=request.date_range,
-                sites=request.sites,
-                findings=[finding for finding, _ in evidence.values()],
-            )
-            items = items_from_draft(await draft(payload), evidence)
-        generated_at = datetime.now(UTC)
-        brief = RiskBrief(
-            run_id=request.run_id,
-            generated_at=generated_at,
+        if not evidence:
+            return []
+        payload = ReportDraftInput(
             date_range=request.date_range,
-            site_ids=[s.site_id for s in request.sites],
-            items=items,
-            markdown=render_markdown(request, items, generated_at),
+            sites=request.sites,
+            findings=[finding for finding, _ in evidence.values()],
         )
+        items = items_from_draft(await draft(payload), evidence)
+        log.info("report.drafted", extra={"items": len(items)})
+        return items
+
+
+def render(request: ReportRequest, items: list[BriefItem]) -> RiskBrief:
+    """Render the final brief (no model call)."""
+    generated_at = datetime.now(UTC)
+    return RiskBrief(
+        run_id=request.run_id,
+        generated_at=generated_at,
+        date_range=request.date_range,
+        site_ids=[s.site_id for s in request.sites],
+        items=items,
+        markdown=render_markdown(request, items, generated_at),
+    )
+
+
+async def run(
+    request: ReportRequest, ctx: RunContext, *, draft: Drafter = _gemini_draft
+) -> RiskBrief:
+    """Draft and render a brief without investigation or review."""
+    items = await draft_items(request, ctx, draft=draft)
+    with ctx.bind():
+        brief = render(request, items)
         log.info("report.done", extra={"items": len(items)})
         return brief

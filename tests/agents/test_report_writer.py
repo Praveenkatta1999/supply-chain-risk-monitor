@@ -3,9 +3,12 @@ import asyncio
 from scrm.agents import report_writer
 from scrm.config import Settings
 from scrm.schemas import (
+    BriefItem,
     DraftItem,
     ReportDraft,
     ReportRequest,
+    RevisedClaim,
+    RevisionDraft,
     RiskScore,
     Verdict,
     VerifiedEvent,
@@ -100,7 +103,8 @@ def test_items_are_ordered_by_risk_and_carry_links(event, site, date_range):
     md = brief.markdown
     assert md.index("Port closed.") < md.index("Minor delay.")
     assert f"Port closed. ([source 1]({B}))" in md
-    assert "severity 4, impact 5, risk 20/25" in md
+    assert "risk 20/25: severity 4, impact 5" in md
+    assert [i.item_id for i in brief.items] == ["I1", "I2"]
     assert f"Also reported, not verified: [link 1]({SUPPORT})" in md
 
 
@@ -150,3 +154,39 @@ def test_no_confirmed_events_skips_the_model(event, site, date_range):
     brief = write(request, draft)
     assert draft.calls == []
     assert "No confirmed disruptions" in brief.markdown
+
+
+def reviewed_item(item_id, claim, risk_sev, status, **extra):
+    return BriefItem(
+        item_id=item_id, site_id="SUP-01", claim=claim, severity=risk_sev, impact=4,
+        status=status, confidence="high", source_urls=[f"https://news.example/{item_id}"],
+        **extra,
+    )  # fmt: skip
+
+
+def test_items_show_status_confidence_and_contradictions(site, date_range):
+    request = ReportRequest(run_id="r1", date_range=date_range, sites=[site], verified_events=[])
+    items = [
+        reviewed_item("I1", "Pipeline shut.", 5, "resolved"),
+        reviewed_item("I2", "Port closed.", 3, "ongoing", contradictions=["'closed for a month'"]),
+    ]
+    md = report_writer.render(request, items).markdown
+    # Resolved disruptions come after live ones, even at higher risk.
+    assert md.index("Port closed.") < md.index("Pipeline shut.")
+    assert "(risk 12/25: severity 3, impact 4) · ongoing · high confidence" in md
+    assert "Contradicted by the evidence: 'closed for a month'" in md
+
+
+def test_revisions_change_only_the_claims_that_were_asked_about():
+    items = [reviewed_item("I1", "Old one.", 3, None), reviewed_item("I2", "Old two.", 3, None)]
+    revision = RevisionDraft(
+        claims=[
+            RevisedClaim(item_id="I1", claim="New one."),
+            RevisedClaim(item_id="I2", claim="Not asked."),
+            RevisedClaim(item_id="I9", claim="Made up."),
+        ]
+    )
+    revised = report_writer.apply_revisions(items, revision, asked={"I1"})
+    assert [i.claim for i in revised] == ["New one.", "Old two."]
+    assert [i.revisions for i in revised] == [1, 0]
+    assert revised[0].source_urls == items[0].source_urls  # sources never change
