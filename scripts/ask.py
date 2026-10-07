@@ -4,8 +4,9 @@ Usage:
     uv run --env-file .env python scripts/ask.py "What are the risks to our chip supply this week?"
         [--today 2026-10-07]
 
-The agent chooses the sites and dates and runs the pipeline once. Logs (JSON, run ID on
-every line) go to stderr. The pipeline result is saved to data/runs/<run_id>.json (the
+The agent chooses the sites and dates and runs the pipeline once. The terminal shows
+one-line progress; full JSON logs (run ID on every line) go to data/logs/<run_id>.jsonl,
+or to the terminal with --verbose. The pipeline result is saved to data/runs/<run_id>.json (the
 same format as scripts/run_brief.py) and the answer, with model calls, to
 data/runs/<run_id>.answer.json.
 """
@@ -18,7 +19,8 @@ from pathlib import Path
 
 from scrm.agents import root_agent
 from scrm.config import get_settings
-from scrm.telemetry import RunContext, configure_logging
+from scrm.progress import setup_cli_logging
+from scrm.telemetry import RunContext
 
 RUNS_DIR = Path("data/runs")
 
@@ -27,11 +29,15 @@ async def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("question")
     parser.add_argument("--today", type=date.fromisoformat, help="default: today, UTC")
+    parser.add_argument(
+        "--verbose", action="store_true", help="show the full JSON log instead of progress"
+    )
     args = parser.parse_args(argv)
     # Claims can quote any language; don't depend on the console's code page.
     sys.stdout.reconfigure(encoding="utf-8")
-    configure_logging(get_settings().log_level)
+    sys.stderr.reconfigure(encoding="utf-8")
     ctx = RunContext.new()
+    log_file = setup_cli_logging(ctx.run_id, verbose=args.verbose, level=get_settings().log_level)
     today = args.today or datetime.now(UTC).date()
     result = await root_agent.run(args.question, ctx, today=today)
 
@@ -58,6 +64,7 @@ async def main(argv: list[str]) -> int:
     calls = result.model_calls
     detail = ", ".join(f"{name} {n}" for name, n in sorted(calls.items()))
     print(f"\nModel calls: {sum(calls.values())} ({detail}). Run ID: {ctx.run_id}")
+    print(f"Logs: {log_file}")
     return 0
 
 

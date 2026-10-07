@@ -56,6 +56,7 @@ from scrm.schemas import (
 from scrm.telemetry import get_logger
 from scrm.tools.article_fetcher import fetch_article
 from scrm.tools.bigquery_tool import BigQueryTool
+from scrm.urls import article_key, unique_urls
 
 NAME = "investigator"
 INPUT_SCHEMA = InvestigatorInput
@@ -75,7 +76,8 @@ log = get_logger(__name__)
 INSTRUCTION = f"""\
 You investigate one story for a supply chain risk team. The input is JSON with a
 monitored site, the subject ("claim": a high-risk claim from the brief, or
-"unverifiable_story": a story whose article could not be read), the claim text, the
+"unverifiable_story": a story whose article could not be read, with its headline words
+(story_title) and triage's reason for picking it (triage_note) when known), the claim text, the
 story's own sources F1, F2, ... (with what the verifier concluded: verdict, scope, reason,
 quote, date), risk scores if any, and the last date you may search (search_until).
 
@@ -408,16 +410,24 @@ async def investigate_story(
     search_until: date,
     tool: BigQueryTool,
     *,
+    triage_note: str | None = None,
     investigate: Investigate = _gemini_investigate,
     fetch: Fetcher = fetch_article,
 ) -> Investigation | None:
-    """Investigate one story the verifier could not judge ("unverifiable")."""
+    """Investigate one story the verifier could not judge ("unverifiable").
+
+    The article itself could not be read, so the investigator gets what is known about the
+    story: its headline words from the URL and triage's reason for picking it.
+    """
     if verified.verdict is not Verdict.UNVERIFIABLE:
         raise ValueError("investigate_story is for unverifiable stories")
+    title = verified.event.title
     return await _run(
         subject="unverifiable_story",
         subject_id=verified.event.event_id,
-        claim=verified.event.title or "Untitled story; the article could not be read.",
+        claim=title or triage_note or "Untitled story; the article could not be read.",
+        story_title=title,
+        triage_note=triage_note,
         events=[verified],
         severity=None,
         impact=None,
@@ -445,6 +455,8 @@ async def _run(
     fetch: Fetcher,
     item_id: str | None = None,
     event_id: str | None = None,
+    story_title: str | None = None,
+    triage_note: str | None = None,
 ) -> Investigation | None:
     """Shared body: build the toolkit and input, run the agent, map IDs back to URLs.
 
@@ -466,6 +478,8 @@ async def _run(
         site=site,
         subject=subject,
         claim=claim,
+        story_title=story_title,
+        triage_note=triage_note,
         sources=[_source(sid, v) for sid, v in sources.items()],
         search_until=search_until,
         severity=severity,
@@ -484,7 +498,7 @@ async def _run(
     except Exception:
         log.exception("investigator.failed", extra={"subject_id": subject_id})
         return None
-    own = {str(v.evidence_url) for v in events}
+    own = {article_key(v.evidence_url) for v in events}
     cited = [toolkit.results[i] for i in judgement.corroborating_ids if i in toolkit.results]
     unknown = [i for i in judgement.corroborating_ids if i not in toolkit.results]
     if unknown:
@@ -494,6 +508,7 @@ async def _run(
     result = Investigation(
         item_id=item_id,
         event_id=event_id,
+        title=story_title or triage_note or claim,
         site_id=site.site_id,
         source_url=source_urls[0],
         source_urls=source_urls,
@@ -501,7 +516,7 @@ async def _run(
         summary=judgement.summary,
         status=judgement.status,
         confidence=judgement.confidence,
-        corroborating_urls=list(dict.fromkeys(u for u in cited if u not in own)),
+        corroborating_urls=[u for u in unique_urls(cited) if article_key(u) not in own],
         tool_calls=min(toolkit.calls, MAX_TOOL_CALLS),
         hit_limit=hit_limit or toolkit.refused > 0,
         evidence=evidence,

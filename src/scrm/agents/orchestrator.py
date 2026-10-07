@@ -7,7 +7,8 @@ Pipeline. Per site, with sites running concurrently:
     risk_scorer    severity and impact for confirmed stories
 Then once, for all sites together:
     report_writer  drafts claims, merging findings about the same event (I1, I2, ...)
-    investigator   once per story: each claim with risk >= 12, each unverifiable story
+    investigator   once per story: each claim with risk >= 12, and each unverifiable
+                   story that triage was clear is about a disruption to the site
     reviewer       critic loop: checks claims against the evidence, sends corrections
                    back to the report writer (at most 2 rounds), sets status/confidence
     report_writer  renders the brief: direct, indirect, investigated unverifiable stories
@@ -135,13 +136,17 @@ async def _run_site(
 async def _investigate(
     items: list[BriefItem],
     unverifiable: list[VerifiedEvent],
+    triage_notes: dict[str, str],
     events: reviewer.EventIndex,
     sites: dict[str, Site],
     search_until: date,
     tool: BigQueryTool,
     limit: asyncio.Semaphore,
 ) -> list[Investigation]:
-    """One investigation per high-risk claim and per unverifiable story, concurrently."""
+    """One investigation per high-risk claim and per unverifiable story, concurrently.
+
+    ``unverifiable`` should already be limited to stories triage was clear about.
+    """
 
     async def claim(item: BriefItem) -> Investigation | None:
         async with limit:
@@ -152,7 +157,11 @@ async def _investigate(
     async def story(event: VerifiedEvent) -> Investigation | None:
         async with limit:
             return await investigator.investigate_story(
-                event, sites[event.event.site_id], search_until, tool
+                event,
+                sites[event.event.site_id],
+                search_until,
+                tool,
+                triage_note=triage_notes.get(event.event.event_id),
             )
 
     jobs = [claim(i) for i in items if investigator.needs_investigation(i)]
@@ -184,9 +193,22 @@ async def run_pipeline(
         )
         items = await report_writer.draft_items(report, ctx)
         events = reviewer.index_events(verified)
+        clear = {
+            s.event_id: s.reason
+            for r in site_runs
+            if r.triage
+            for s in r.triage.selected
+            if s.certainty == "clear"
+        }
+        # An unreadable story is only worth an investigation if triage was clear it is
+        # about a disruption to the site.
+        unverifiable = [
+            v for v in verified if v.verdict is Verdict.UNVERIFIABLE and v.event.event_id in clear
+        ]
         investigations = await _investigate(
             items,
-            [v for v in verified if v.verdict is Verdict.UNVERIFIABLE],
+            unverifiable,
+            clear,
             events,
             {s.site_id: s for s in sites},
             request.date_range.end,

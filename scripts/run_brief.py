@@ -4,7 +4,9 @@ Usage:
     uv run --env-file .env python scripts/run_brief.py [--sites P05 S01 | --sites all] [--days 30]
         [--end 2026-10-05] [--compare RUN_ID]
 
-Logs (JSON, one line per event, all carrying the run ID) go to stderr. The Markdown brief,
+The terminal shows one-line progress (stderr) and full JSON logs go to
+data/logs/<run_id>.jsonl, every line carrying the run ID; --verbose shows the full JSON
+log in the terminal instead. The Markdown brief,
 per-site verification numbers, investigations, review rounds and model calls go
 to stdout; --compare
 also prints the same numbers for an earlier saved run. The full result is saved to
@@ -20,8 +22,9 @@ from pathlib import Path
 
 from scrm.agents import orchestrator
 from scrm.config import get_settings
+from scrm.progress import setup_cli_logging
 from scrm.schemas import BriefRequest, DateRange, PipelineResult, SiteRun, Verdict
-from scrm.telemetry import RunContext, configure_logging, get_logger
+from scrm.telemetry import RunContext, get_logger
 
 RUNS_DIR = Path("data/runs")
 log = get_logger("run_brief")
@@ -35,6 +38,9 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--days", type=int, default=30, help="window length, inclusive")
     parser.add_argument("--end", type=date.fromisoformat, help="last day (default: today, UTC)")
     parser.add_argument("--compare", metavar="RUN_ID", help="earlier saved run to compare")
+    parser.add_argument(
+        "--verbose", action="store_true", help="show the full JSON log instead of progress"
+    )
     return parser.parse_args(argv)
 
 
@@ -110,8 +116,9 @@ async def main(argv: list[str]) -> int:
     args = parse_args(argv)
     # Claims can quote any language; don't depend on the console's code page.
     sys.stdout.reconfigure(encoding="utf-8")
-    configure_logging(get_settings().log_level)
+    sys.stderr.reconfigure(encoding="utf-8")
     ctx = RunContext.new()
+    log_file = setup_cli_logging(ctx.run_id, verbose=args.verbose, level=get_settings().log_level)
     end = args.end or datetime.now(UTC).date()
     request = BriefRequest(
         site_ids=[] if args.sites == ["all"] else args.sites,  # empty means every site
@@ -130,7 +137,7 @@ async def main(argv: list[str]) -> int:
     print_investigations(result)
     print_review(result)
     print(f"\nBigQuery bytes processed: {sum(r.bytes_processed for r in result.site_runs):,}")
-    print(f"Run ID: {ctx.run_id}. Full result saved to {saved}")
+    print(f"Run ID: {ctx.run_id}. Full result saved to {saved}; logs in {log_file}")
     return 0
 
 

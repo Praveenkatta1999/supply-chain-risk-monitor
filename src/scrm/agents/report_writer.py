@@ -43,6 +43,7 @@ from scrm.schemas import (
     VerifiedEvent,
 )
 from scrm.telemetry import RunContext, get_logger
+from scrm.urls import article_key, unique_urls
 
 NAME = "report_writer"
 INPUT_SCHEMA = ReportRequest
@@ -127,11 +128,11 @@ Evidence = dict[str, tuple[Finding, VerifiedEvent]]  # finding_id -> (finding, e
 
 def gather_evidence(request: ReportRequest) -> Evidence:
     """Number the confirmed events F1, F2, ... and attach their risk scores."""
-    scores = {(s.site_id, str(s.source_url)): s for s in request.scores}
+    scores = {(s.site_id, article_key(s.source_url)): s for s in request.scores}
     confirmed = [v for v in request.verified_events if v.verdict is Verdict.YES]
     evidence: Evidence = {}
     for n, v in enumerate(confirmed, 1):
-        score = scores.get((v.event.site_id, str(v.evidence_url)))
+        score = scores.get((v.event.site_id, article_key(v.evidence_url)))
         finding = Finding(
             finding_id=f"F{n}",
             site_id=v.event.site_id,
@@ -149,7 +150,9 @@ def gather_evidence(request: ReportRequest) -> Evidence:
 def _brief_item(site_id: str, claim: str, cited: list[tuple[Finding, VerifiedEvent]]) -> BriefItem:
     """Build an item whose sources, supporting links and scores all come from ``cited``."""
     worst, _ = max(cited, key=lambda fv: (fv[0].severity or 0) * (fv[0].impact or 0))
-    supporting = dict.fromkeys(u for _, v in cited for u in v.event.supporting_urls)
+    sources = [v.evidence_url for _, v in cited]
+    supporting = [u for _, v in cited for u in v.event.supporting_urls]
+    source_keys = {article_key(u) for u in sources}
     scopes = {f.scope for f, _ in cited}
     # A claim built on any direct finding is direct; scope is None only for legacy runs.
     scope = Scope.DIRECT if Scope.DIRECT in scopes else next(iter(scopes - {None}), None)
@@ -159,8 +162,8 @@ def _brief_item(site_id: str, claim: str, cited: list[tuple[Finding, VerifiedEve
         scope=scope,
         severity=worst.severity,
         impact=worst.impact,
-        source_urls=[v.evidence_url for _, v in cited],
-        supporting_urls=list(supporting),
+        source_urls=unique_urls(sources),
+        supporting_urls=[u for u in unique_urls(supporting) if article_key(u) not in source_keys],
     )
 
 
@@ -250,8 +253,8 @@ def _item_investigations(
     by_item = [i for i in investigations if i.item_id and i.item_id == item.item_id]
     if by_item:
         return by_item
-    sources = {str(u) for u in item.source_urls}
-    return [i for i in investigations if not i.item_id and str(i.source_url) in sources]
+    sources = {article_key(u) for u in item.source_urls}
+    return [i for i in investigations if not i.item_id and article_key(i.source_url) in sources]
 
 
 def _render_item(
@@ -276,7 +279,7 @@ def _render_item(
 
 def _render_unverifiable(request: ReportRequest, sites: dict[str, Site]) -> list[str]:
     """Stories whose article could not be read, with what the investigator found."""
-    events = {str(v.evidence_url): v for v in request.verified_events}
+    events = {article_key(v.evidence_url): v for v in request.verified_events}
     rows = [i for i in request.investigations if i.trigger == "unverifiable"]
     if not rows:
         return []
@@ -290,7 +293,8 @@ def _render_unverifiable(request: ReportRequest, sites: dict[str, Site]) -> list
     ]
     for inv in rows:
         site = sites[inv.site_id]
-        title = events[str(inv.source_url)].event.title or "untitled story"
+        event = events.get(article_key(inv.source_url))
+        title = inv.title or (event.event.title if event else None) or "untitled story"
         lines += [
             f"- **{site.site_id} {site.site_name}**: {title} ([story]({inv.source_url}))",
             _investigation_line(inv),

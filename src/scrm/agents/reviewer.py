@@ -38,6 +38,7 @@ from scrm.schemas import (
     VerifiedEvent,
 )
 from scrm.telemetry import RunContext, get_logger
+from scrm.urls import article_key
 
 NAME = "reviewer"
 INPUT_SCHEMA = ReviewInput
@@ -97,16 +98,17 @@ async def _gemini_review(payload: ReviewInput) -> ReviewDraft:
     return await run_structured(build_agent(get_settings()), payload, ReviewDraft)
 
 
-EventIndex = dict[tuple[str, str], VerifiedEvent]  # (site_id, evidence URL) -> event
+EventIndex = dict[tuple[str, str], VerifiedEvent]  # (site_id, article key) -> event
 
 
 def index_events(events: list[VerifiedEvent]) -> EventIndex:
-    """Key verified events by site and URL: one article can be a story for two sites."""
-    return {(v.event.site_id, str(v.evidence_url)): v for v in events}
+    """Key verified events by site and article: one article can be a story for two sites,
+    and http and https versions of a URL are the same article."""
+    return {(v.event.site_id, article_key(v.evidence_url)): v for v in events}
 
 
 def sources_of(item: BriefItem, events: EventIndex) -> list[VerifiedEvent]:
-    keys = [(item.site_id, str(u)) for u in item.source_urls]
+    keys = [(item.site_id, article_key(u)) for u in item.source_urls]
     return [events[k] for k in keys if k in events]
 
 

@@ -80,6 +80,8 @@ flowchart TD
 - Brief (calls Gemini and BigQuery):
   `uv run --env-file .env python scripts/run_brief.py --sites P05 S01 C01 P02 --days 30 [--end YYYY-MM-DD] [--compare RUN_ID]`
   (saves the full result to `data/runs/<run_id>.json`, gitignored)
+- Scripts show one-line progress and write full JSON logs to `data/logs/<run_id>.jsonl`;
+  add `--verbose` to see the full log in the terminal
 - Ask the root agent: `uv run --env-file .env python scripts/ask.py "What are the risks to our chip supply this week?"`
 - BigQuery smoke test: `uv run --env-file .env python scripts/check_bigquery.py`
 - Export scrm tables to Parquet (`data/*.parquet`, gitignored; checks row counts):
@@ -105,6 +107,8 @@ flowchart TD
   never sources, scope or scores.
 - Never rewrite `evals/dataset.jsonl` while human labels may be in progress; append only
   (`scripts/add_eval_cases.py`). Human labels are never overwritten by code.
+- Compare URLs with `scrm.urls.article_key` (http and https are the same article), never
+  raw strings.
 - Logging is structured JSON (`scrm.telemetry`). Every agent takes a `RunContext`, and
   work runs inside `ctx.bind()` so `run_id` appears on every log line.
 
