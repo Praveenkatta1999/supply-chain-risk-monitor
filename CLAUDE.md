@@ -157,16 +157,25 @@ flowchart TD
       10e2cf2f2b0a (same window): investigations 13 -> 7, investigator calls 112 -> 57,
       total model calls 176 -> 108
 - [x] `reviewer` critic loop (at most 2 revision rounds); every claim shows status and
-      confidence. In run 65381870a2f6 it caught a claim tying a storm warning to Hsinchu
+      confidence (a failed later round keeps the previous round's status and confidence).
+      In run 65381870a2f6 it caught a claim tying a storm warning to Hsinchu
       that the quote did not support, and the writer removed it
 - [x] `root_agent`: plain-language question -> sites and dates -> pipeline as a tool ->
       answer with the brief attached (`scripts/ask.py`). "Chip supply this week" chose
       S01, S07, S09, S11 for 2026-10-01..07; 30 model calls
-- [ ] Reviewer only sees the investigator's summary, not the corroborating articles: in run
-      11ad747002b1 the C01 claim says Suez traffic is falling while one corroborating link
-      says traffic returned to normal. Pass short excerpts of cited articles to the reviewer
-- [ ] Investigator results vary between runs (the S01 Hsinchu story: "a drill, resolved"
-      in one run, "unclear, nothing found" in the next). Consider two samples or caching
+- [x] Reviewer sees the investigator's verbatim excerpts (checked against what it read),
+      marked supports / contradicts / context. Run 7244c0eeeec1 (C01): the reviewer flagged
+      "reducing Suez traffic" against "traffic operating normally ... revenue up 56.7%" and
+      the pipeline restart, and the claim was rewritten to resolved after 2 revisions
+- [x] Investigator variance: explicit status/confidence rules plus temperature 0.2
+      (`SCRM_INVESTIGATOR_TEMPERATURE`; Google recommends the default for Gemini 3.x). Same
+      S01 story x3: status unclear 3/3 both ways; confidence low 3/3 at 0.2, varied at default.
+      Summaries still vary (README, Known limitations)
+- [x] Showcase: all 22 sites, 2026-09-08..10-07 (run c8f070ecbfb2, 409 model calls),
+      `docs/sample_brief.md`; per-agent calls in the README
+- [ ] `docs/sample_questions.md` has 1 of 3 questions (chip supply). Shipping routes to
+      Europe and a single-supplier question were not run: the GCP project hit its Vertex AI
+      spend cap on 2026-10-07 during the showcase run. Raise the cap, then run scripts/ask.py
 - [ ] Verifier with the rubric may be lenient on "indirect" for chokepoints: C01 confirmed
       12 of 12 judged in run 11ad747002b1. Label the C01 cases first
 - [ ] S01 still has no confirmed disruption: the entity path finds TSMC mentions, mostly

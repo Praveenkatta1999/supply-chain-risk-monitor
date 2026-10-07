@@ -201,3 +201,48 @@ def test_other_failures_return_none(event, site):
             investigate=broken,
         )
     ) is None  # fmt: skip
+
+
+def test_only_verbatim_evidence_from_what_was_read_is_kept(event, site):
+    from scrm.schemas import EvidenceSnippet
+
+    async def investigate(payload, kit):
+        await kit.search_news("rhine low water")  # R1, R2 titles registered
+        await kit.read_article("F1")  # fetch_ok returns "Barges stuck."
+        return InvestigationJudgement(
+            summary="s", status="ongoing", confidence="medium",
+            evidence=[
+                EvidenceSnippet(result_id="F1", quote="barges  STUCK", stance="supports"),
+                EvidenceSnippet(result_id="R2", quote="rhine traffic restricted", stance="context"),
+                EvidenceSnippet(
+                    result_id="R1", quote="Traffic returned to normal.", stance="contradicts"
+                ),
+                EvidenceSnippet(result_id="R9", quote="anything", stance="supports"),
+            ],
+        )  # fmt: skip
+
+    async def fetch_ok(url):
+        return Article(url=url, title="T", text="Barges stuck.", fetched_at=datetime.now(UTC))
+
+    result = asyncio.run(
+        investigator.investigate_claim(
+            claim_item(event, 4, 4), [confirmed(event)], site, date(2026, 10, 5),
+            FakeTool(ROWS), investigate=investigate, fetch=fetch_ok,
+        )
+    )  # fmt: skip
+    assert [(e.stance, e.quote) for e in result.evidence] == [
+        ("supports", "barges  STUCK"),
+        ("context", "rhine traffic restricted"),
+    ]  # the invented R1 quote and the unknown R9 are dropped
+    assert str(result.evidence[1].url) == ROWS[1]["url"]
+
+
+def test_investigator_temperature_comes_from_settings(site):
+    from scrm.config import Settings
+
+    kit = toolkit(site)
+    unset = investigator.build_agent(Settings(investigator_temperature=None), kit)
+    assert (
+        unset.generate_content_config is None or unset.generate_content_config.temperature is None
+    )
+    assert investigator.build_agent(Settings(), kit).generate_content_config.temperature == 0.2

@@ -159,3 +159,45 @@ def test_failed_revision_keeps_the_reviewed_claim_with_its_flags(event):
     final, _ = loop(items, events, investigations, review, broken)
     assert final[0].claim == items[0].claim
     assert final[0].status == "resolved" and final[0].contradictions == ["'shut'"]
+
+
+def test_reviewer_sees_investigator_excerpts_without_urls(event):
+    from scrm.schemas import InvestigationEvidence
+
+    items, events, investigations = setup(event)
+    investigations[0] = investigations[0].model_copy(
+        update={
+            "evidence": [
+                InvestigationEvidence(
+                    url="https://other.example/a", quote="Traffic returned to normal.",
+                    stance="context",
+                )
+            ]
+        }
+    )  # fmt: skip
+    review = scripted_reviews([ClaimReview(item_id="I1", status="unclear", confidence="low")])
+    loop(items, events, investigations, review, reviser("unused"))
+    (row,) = review.seen[0].items
+    assert [(s.stance, s.quote) for s in row.investigation_evidence] == [
+        ("context", "Traffic returned to normal.")
+    ]
+    assert "other.example" not in review.seen[0].model_dump_json()
+
+
+def test_failed_later_round_keeps_the_previous_status_and_confidence(event):
+    items, events, investigations = setup(event)
+    first = ClaimReview(
+        item_id="I1", status="resolved", confidence="high", corrections=["Remove 'shut'."]
+    )
+    calls = []
+
+    async def review(payload):
+        calls.append(payload)
+        if len(calls) == 1:
+            return ReviewDraft(reviews=[first])
+        raise RuntimeError("403 spend cap")
+
+    final, rounds = loop(items, events, investigations, review, reviser("The port is closed."))
+    assert final[0].claim == "The port is closed."  # the revision is kept
+    assert (final[0].status, final[0].confidence) == ("resolved", "high")
+    assert len(rounds) == 1

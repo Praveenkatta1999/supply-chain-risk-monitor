@@ -79,6 +79,49 @@ Built with [Google ADK](https://adk.dev/), Gemini on Gemini Enterprise Agent Pla
   fails validation.
 - **No keys.** Authentication uses Application Default Credentials only.
 
+## Showcase run
+
+[`docs/sample_brief.md`](docs/sample_brief.md) is a full brief for all 22 sites over
+2026-09-08 to 2026-10-07 (run `c8f070ecbfb2`): 1,076
+candidate stories triaged, 171 sent to the verifier, 21 claims
+after merging, 19 investigations, 4.5 GB of BigQuery scanned.
+[`docs/sample_questions.md`](docs/sample_questions.md) shows the root agent answering a
+plain-language question.
+
+Model calls per agent in the showcase run:
+
+| Agent | Model calls |
+|---|---|
+| verifier | 160 |
+| investigator | 159 |
+| risk_scorer | 65 |
+| triage | 22 |
+| report_writer | 2 |
+| reviewer | 1 |
+| **Total** | **409** |
+
+One model request per row unit: the investigator counts every tool round-trip. The
+reviewer's second round was refused when the GCP project reached its spend cap; the
+brief keeps the first round's corrections, status and confidence.
+
+## Known limitations
+
+- **Investigator answers still vary somewhat between runs.** The investigator follows
+  explicit rules for status and confidence and runs at temperature 0.2. Rerunning the same
+  unverifiable S01 story three times gave the same status ("unclear") every time, and the
+  same confidence ("low") every time at 0.2; at the default temperature confidence varied
+  (medium, low, low). The summaries still differ in which facts they mention, and three
+  runs of one story is a small sample. Google advises keeping Gemini 3.x models at their
+  default temperature, so this setting is a deliberate trade-off
+  (`SCRM_INVESTIGATOR_TEMPERATURE`).
+- **Scores are not revised.** When the reviewer marks a claim resolved, the claim text is
+  corrected and the item moves below live disruptions, but its severity and impact keep
+  the risk scorer's original values.
+- **Coverage depends on GDELT geocoding.** Only articles geocoded near a monitored site are
+  in the `scrm` tables; the entity path widens this to articles near any monitored site.
+- **Human labels are partial.** The verifier is evaluated on 20 labelled P05 cases; 66 more
+  cases (S01, C01, P02, P05) await labels.
+
 ## Data
 
 Dataset `scrm` (US multi-region), built from public GDELT tables by the SQL in `sql/`:

@@ -387,6 +387,17 @@ class InvestigatorInput(_Model):
     impact: Score | None
 
 
+Stance = Literal["supports", "contradicts", "context"]
+
+
+class EvidenceSnippet(_Model):
+    """A verbatim excerpt the investigator cites, by result ID (no URL)."""
+
+    result_id: str
+    quote: str = Field(description="Verbatim from the article text or the result's title.")
+    stance: Stance = Field(description="Does it support or contradict the claim, or add context?")
+
+
 class InvestigationJudgement(_Model):
     """The investigator model's structured answer."""
 
@@ -396,6 +407,17 @@ class InvestigationJudgement(_Model):
     corroborating_ids: list[str] = Field(
         default_factory=list, description="Result IDs (R1, R2, ...) that corroborate it."
     )
+    evidence: list[EvidenceSnippet] = Field(
+        default_factory=list, description="Up to 5 verbatim excerpts, supporting or not."
+    )
+
+
+class InvestigationEvidence(_Model):
+    """An excerpt checked to appear verbatim in what the investigator read, with its URL."""
+
+    url: HttpUrl
+    quote: str
+    stance: Stance
 
 
 class Investigation(_Model):
@@ -418,6 +440,7 @@ class Investigation(_Model):
     corroborating_urls: list[HttpUrl] = Field(default_factory=list)
     tool_calls: int = Field(ge=0)
     hit_limit: bool = False
+    evidence: list[InvestigationEvidence] = Field(default_factory=list)
 
 
 class ReportRequest(_Model):
@@ -474,6 +497,13 @@ class ReviewEvidence(_Model):
     quote: str | None
 
 
+class ReviewSnippet(_Model):
+    """An investigator excerpt as the reviewer sees it (no URL)."""
+
+    stance: Stance
+    quote: str
+
+
 class ReviewItem(_Model):
     """One claim as the reviewer sees it, with all the evidence behind it (no URLs)."""
 
@@ -487,6 +517,7 @@ class ReviewItem(_Model):
     investigation_summary: str | None
     investigation_status: Status | None
     investigation_confidence: Confidence | None
+    investigation_evidence: list[ReviewSnippet] = Field(default_factory=list)
 
 
 class ReviewInput(_Model):

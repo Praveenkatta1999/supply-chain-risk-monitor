@@ -33,6 +33,7 @@ from scrm.schemas import (
     ReviewInput,
     ReviewItem,
     ReviewRound,
+    ReviewSnippet,
     RevisionItem,
     VerifiedEvent,
 )
@@ -53,7 +54,12 @@ published. The input is JSON with the claims. Each has an item_id, the claim tex
 scope ("direct": the site itself; "indirect": a connected route or region), risk scores,
 the verifier's evidence (one-sentence reasons and verbatim quotes from the source
 articles), and, for high-risk claims, the investigator's summary, status and confidence
-from searching for corroborating and newer reports.
+from searching for corroborating and newer reports, with verbatim excerpts from what it
+read, each marked "supports", "contradicts" or "context".
+
+Check every statement in the claim against every excerpt, including those marked
+"supports" or "context": an excerpt can contradict one statement while supporting
+another (e.g. "traffic returned to normal" contradicts "reducing transit traffic").
 
 Return one review per claim:
 - status: "ongoing", "resolved" or "unclear". Use the investigator's finding when there
@@ -134,6 +140,11 @@ def review_input(
                 investigation_summary=inv.summary if inv else None,
                 investigation_status=inv.status if inv else None,
                 investigation_confidence=inv.confidence if inv else None,
+                investigation_evidence=[
+                    ReviewSnippet(stance=e.stance, quote=e.quote) for e in inv.evidence
+                ]
+                if inv
+                else [],
             )
         )
     return ReviewInput(items=rows)
@@ -214,9 +225,12 @@ async def review_and_revise(
                 reviews = known_reviews(
                     await review(review_input(items, events, investigations)), items
                 )
-            except Exception:  # publish unreviewed rather than lose the brief
+            except Exception:  # never lose the brief over a failed review
                 log.exception("reviewer.failed", extra={"round": number})
-                return items, rounds
+                # Keep the last completed review's status and confidence (claims may have
+                # been revised since); with no completed review, publish unreviewed.
+                previous = rounds[-1].reviews if rounds else []
+                return apply_reviews(items, previous), rounds
             requests = revision_requests(items, reviews, events, investigations)
             last = not requests or number > MAX_REVISIONS
             rounds.append(

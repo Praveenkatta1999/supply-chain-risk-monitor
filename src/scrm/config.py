@@ -24,6 +24,15 @@ class Settings(BaseModel):
         description="Queries whose dry run exceeds this many bytes are refused.",
     )
     gemini_model: str = Field(default="gemini-3.5-flash", description="Model ID for all agents.")
+    investigator_temperature: float | None = Field(
+        default=0.2,
+        ge=0,
+        le=2,
+        description="Sampling temperature for the investigator. 0.2 gave the same status and "
+        "confidence in 3 of 3 reruns of one story (default temperature: 2 of 3). Google "
+        "advises keeping Gemini 3.x at its default; set SCRM_INVESTIGATOR_TEMPERATURE to 1.0 "
+        "to follow that advice.",
+    )
     log_level: str = Field(default="INFO")
 
     @classmethod
@@ -35,6 +44,7 @@ class Settings(BaseModel):
             "bq_location": os.getenv("SCRM_BQ_LOCATION"),
             "max_bytes_billed": os.getenv("SCRM_MAX_BYTES_BILLED"),
             "gemini_model": os.getenv("SCRM_GEMINI_MODEL"),
+            "investigator_temperature": os.getenv("SCRM_INVESTIGATOR_TEMPERATURE"),
             "log_level": os.getenv("SCRM_LOG_LEVEL"),
         }
         return cls.model_validate({k: v for k, v in env.items() if v})
