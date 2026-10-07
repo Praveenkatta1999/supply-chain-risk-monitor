@@ -61,7 +61,8 @@ class Event(_Model):
     source_table: Literal["events_near_sites", "gkg_near_sites"]
     site_id: str
     event_date: date
-    title: str | None = None
+    title: str | None = Field(default=None, description="Headline words from the URL slug.")
+    source: str | None = Field(default=None, description="Publisher domain.")
     actors: list[str] = Field(default_factory=list)
     organizations: list[str] = Field(default_factory=list)
     themes: list[str] = Field(default_factory=list)
@@ -78,6 +79,15 @@ class Event(_Model):
     supporting_urls: list[HttpUrl] = Field(
         default_factory=list,
         description="Other articles in the same story cluster; not verified individually.",
+    )
+    matched_entities: list[str] = Field(
+        default_factory=list,
+        description="Organisation names that entity_resolver matched to this site's company.",
+    )
+    retrieval: Literal["location", "entity"] = Field(
+        default="location",
+        description="'location': geocoded inside this site's radius. 'entity': names this "
+        "site's company but was geocoded near another monitored site.",
     )
 
 
@@ -113,11 +123,24 @@ class Verdict(StrEnum):
     UNVERIFIABLE = "unverifiable"  # the article could not be read; nothing was guessed
 
 
+class Scope(StrEnum):
+    """How a disruption relates to the site (the verifier's rubric)."""
+
+    DIRECT = "direct"  # the site itself is affected
+    INDIRECT = "indirect"  # a connected route, supplier region or hinterland is affected
+    NOT_RELEVANT = "not_relevant"  # no real disruption that touches this site
+
+
 class VerifiedEvent(_Model):
-    """An event after the verifier has read (or failed to read) its source article."""
+    """An event after the verifier has read (or failed to read) its source article.
+
+    ``verdict`` is "yes" for direct and indirect disruptions; ``scope`` says which. Scope
+    is None when the article could not be judged (and for runs before the rubric existed).
+    """
 
     event: Event
     verdict: Verdict
+    scope: Scope | None = None
     reason: str = Field(min_length=1, description="One sentence explaining the verdict.")
     quote: str | None = Field(
         default=None, description="Verbatim text from the article supporting the verdict."
@@ -128,6 +151,15 @@ class VerifiedEvent(_Model):
     def _yes_needs_a_quote(self) -> Self:
         if self.verdict is Verdict.YES and not self.quote:
             raise ValueError("a 'yes' verdict must quote the article")
+        return self
+
+    @model_validator(mode="after")
+    def _scope_matches_verdict(self) -> Self:
+        if self.scope is None:
+            return self
+        relevant = self.scope in (Scope.DIRECT, Scope.INDIRECT)
+        if relevant != (self.verdict is Verdict.YES):
+            raise ValueError(f"scope {self.scope} contradicts verdict {self.verdict}")
         return self
 
 
@@ -147,6 +179,7 @@ class BriefItem(_Model):
 
     site_id: str
     claim: str = Field(min_length=1)
+    scope: Scope | None = None
     severity: Score | None = None
     impact: Score | None = None
     source_urls: list[HttpUrl] = Field(min_length=1, description="Verified sources.")
@@ -206,15 +239,14 @@ class QueryResult(_Model):
 
 
 class EntityResolutionRequest(_Model):
-    raw_names: list[str]
-    candidate_companies: list[str]
+    raw_names: list[str] = Field(description="Organisation names as GDELT extracted them.")
+    site: Site
 
 
 class EntityMatch(_Model):
     raw_name: str
-    company: str | None = Field(description="Matched company, or None if no confident match.")
-    confidence: float = Field(ge=0, le=1)
-    reason: str
+    site_id: str
+    alias: str = Field(description="The company name or alias that matched.")
 
 
 class EntityResolutionResult(_Model):
@@ -239,12 +271,58 @@ class VerifierInput(_Model):
 class VerifierJudgement(_Model):
     """The verifier LLM's structured answer, before the quote is checked against the text."""
 
-    verdict: Verdict
+    assessment: Literal["direct", "indirect", "not_relevant", "unverifiable"]
     reason: str = Field(description="One sentence, in English.")
     # Defaults to None because the model sometimes omits the field instead of sending null.
     quote: str | None = Field(
         default=None,
         description="A short verbatim excerpt from article_text, in its original language.",
+    )
+
+
+class TriageCandidate(_Model):
+    """One candidate story as the triage model sees it: metadata only, no URL."""
+
+    candidate_id: str
+    title: str | None
+    source: str | None
+    event_date: date
+    place: str | None
+    themes: list[str]
+    organizations: list[str]
+    matched_entities: list[str]
+    cluster_size: int
+
+
+class TriageInput(_Model):
+    site: Site
+    candidates: list[TriageCandidate]
+
+
+class TriagePick(_Model):
+    candidate_id: str
+    reason: str = Field(description="One line, in English.")
+
+
+class TriageDraft(_Model):
+    """The triage model's answer: the candidates worth sending to the verifier."""
+
+    picks: list[TriagePick]
+
+
+class TriageSelection(_Model):
+    event_id: str
+    reason: str
+
+
+class TriageResult(_Model):
+    """Which candidates triage sent to the verifier, and why."""
+
+    site_id: str
+    considered: int = Field(ge=0)
+    selected: list[TriageSelection]
+    fallback: bool = Field(
+        default=False, description="True if the triage call failed and top-ranked were used."
     )
 
 
@@ -258,6 +336,7 @@ class ScorerInput(_Model):
 
     site: Site
     event_date: date
+    scope: Scope | None
     reason: str
     quote: str
     cluster_size: int
@@ -271,12 +350,58 @@ class RiskJudgement(_Model):
     reason: str = Field(description="One sentence, in English.")
 
 
+class InvestigatorInput(_Model):
+    """What the investigator model is asked to check. URLs are replaced by result IDs."""
+
+    site: Site
+    finding_id: str = Field(description="Result ID of the finding's own article (F0).")
+    title: str | None
+    event_date: date
+    search_until: date
+    verdict: Verdict
+    scope: Scope | None
+    reason: str
+    quote: str | None
+    severity: Score | None
+    impact: Score | None
+
+
+class InvestigationJudgement(_Model):
+    """The investigator model's structured answer."""
+
+    summary: str = Field(description="At most three sentences, in English.")
+    status: Literal["ongoing", "resolved", "unclear"]
+    confidence: Literal["high", "medium", "low"]
+    corroborating_ids: list[str] = Field(
+        default_factory=list, description="Result IDs (R1, R2, ...) that corroborate it."
+    )
+
+
+class Investigation(_Model):
+    """An investigated finding, with corroborating sources mapped back to URLs."""
+
+    event_id: str
+    site_id: str
+    source_url: HttpUrl
+    trigger: Literal["high_risk", "unverifiable"]
+    summary: str
+    status: Literal["ongoing", "resolved", "unclear"]
+    confidence: Literal["high", "medium", "low"]
+    corroborating_urls: list[HttpUrl] = Field(default_factory=list)
+    tool_calls: int = Field(ge=0)
+    hit_limit: bool = False
+
+
 class ReportRequest(_Model):
     run_id: str
     date_range: DateRange
     sites: list[Site]
     verified_events: list[VerifiedEvent]
-    scores: list[RiskScore] = Field(default_factory=list)  # unused until risk_scorer exists
+    scores: list[RiskScore] = Field(default_factory=list)
+    investigations: list[Investigation] = Field(default_factory=list)
+    considered: dict[str, int] = Field(
+        default_factory=dict, description="Candidate stories triaged, per site_id."
+    )
 
 
 class Finding(_Model):
@@ -288,6 +413,7 @@ class Finding(_Model):
 
     finding_id: str
     site_id: str
+    scope: Scope | None
     event_date: date
     reason: str
     quote: str
@@ -320,8 +446,10 @@ class SiteRun(_Model):
 
     site: Site
     candidates: list[Event]
+    triage: TriageResult | None = None
     verified_events: list[VerifiedEvent]
     scores: list[RiskScore]
+    investigations: list[Investigation] = Field(default_factory=list)
     bytes_processed: int = Field(ge=0)
 
 

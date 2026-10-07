@@ -74,3 +74,10 @@ def test_words_common_across_a_site_do_not_count_as_shared():
     filler = [item(f"https://z.example/rotterdam-haven-nieuws-{w}", day=20) for w in words]
     clusters = clustering.cluster(stories + filler)
     assert [0] in clusters and [1] in clusters
+
+
+def test_slug_title_is_readable_headline_or_none():
+    url = "https://www.hellenicshippingnews.com/rhine-water-levels-fall-to-new-record-low/"
+    assert clustering.slug_title(url) == "rhine water levels fall to new record low"
+    assert clustering.slug_title("https://www.netscape.com/f2a-bf3c-f9eb") is None
+    assert clustering.slug_title("https://www.setn.com/news/1906280") is None

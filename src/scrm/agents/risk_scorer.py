@@ -26,7 +26,8 @@ log = get_logger(__name__)
 
 INSTRUCTION = """\
 You score supply chain risk for a laptop maker. The input is JSON with one monitored site
-(a port, factory or shipping chokepoint) and a verified disruption: the verifier's
+(a port, factory or shipping chokepoint) and a verified disruption: its scope ("direct":
+the site itself is affected; "indirect": a connected route or region is), the verifier's
 one-sentence reason, a verbatim quote from the source article, and how many articles
 covered the story (cluster_size).
 
@@ -47,6 +48,8 @@ impact: how much it disrupts THIS site's operations or cargo flows.
   5 the site is shut or cargo through it is halted
 
 reason: exactly one sentence in English explaining both scores.
+Indirect disruptions usually have lower impact than direct ones, unless the evidence shows
+the site's own throughput is constrained.
 Do not raise scores for wide coverage alone; cluster_size only shows how visible it is.
 """
 
@@ -82,6 +85,7 @@ async def run(
         payload = ScorerInput(
             site=request.site,
             event_date=verified.event.event_date,
+            scope=verified.scope,
             reason=verified.reason,
             quote=verified.quote,
             cluster_size=verified.event.cluster_size,

@@ -7,6 +7,7 @@ from scrm.schemas import (
     Article,
     FetchFailure,
     FetchFailureReason,
+    Scope,
     Verdict,
     VerificationRequest,
     VerifierJudgement,
@@ -28,12 +29,12 @@ async def fetch_dead(url):
     return FetchFailure(url=url, reason=FetchFailureReason.DEAD_LINK, detail="HTTP 404")
 
 
-def judge_returning(verdict: Verdict, quote: str | None):
+def judge_returning(assessment: str, quote: str | None):
     calls = []
 
     async def judge(payload):
         calls.append(payload)
-        return VerifierJudgement(verdict=verdict, reason="Because.", quote=quote)
+        return VerifierJudgement(assessment=assessment, reason="Because.", quote=quote)
 
     judge.calls = calls
     return judge
@@ -58,7 +59,7 @@ def test_quote_matching_ignores_whitespace_case_and_curly_quotes():
 
 
 def test_dead_link_is_unverifiable_without_calling_the_model(event, site):
-    judge = judge_returning(Verdict.YES, "halted")
+    judge = judge_returning("direct", "halted")
     result = verify(VerificationRequest(event=event, site=site), fetch_dead, judge)
     assert result.verdict is Verdict.UNVERIFIABLE
     assert "dead_link" in result.reason
@@ -66,7 +67,7 @@ def test_dead_link_is_unverifiable_without_calling_the_model(event, site):
 
 
 def test_yes_with_real_quote_is_kept(event, site):
-    judge = judge_returning(Verdict.YES, "The strike has halted all container handling.")
+    judge = judge_returning("direct", "The strike has halted all container handling.")
     result = verify(VerificationRequest(event=event, site=site), fetch_ok, judge)
     assert result.verdict is Verdict.YES
     assert result.quote == "The strike has halted all container handling."
@@ -75,14 +76,14 @@ def test_yes_with_real_quote_is_kept(event, site):
 
 
 def test_yes_with_invented_quote_is_downgraded(event, site):
-    judge = judge_returning(Verdict.YES, "The port is closed for a month.")
+    judge = judge_returning("direct", "The port is closed for a month.")
     result = verify(VerificationRequest(event=event, site=site), fetch_ok, judge)
     assert result.verdict is Verdict.UNVERIFIABLE
     assert "quote" in result.reason
 
 
 def test_no_with_invented_quote_keeps_verdict_but_drops_quote(event, site):
-    judge = judge_returning(Verdict.NO, "Not in the article.")
+    judge = judge_returning("not_relevant", "Not in the article.")
     result = verify(VerificationRequest(event=event, site=site), fetch_ok, judge)
     assert result.verdict is Verdict.NO
     assert result.quote is None
@@ -101,7 +102,26 @@ def test_run_many_preserves_order(event, site):
     requests = [VerificationRequest(event=e, site=site) for e in (event, other)]
     results = asyncio.run(
         verifier.run_many(
-            requests, RunContext.new(), fetch=fetch_ok, judge=judge_returning(Verdict.NO, None)
+            requests, RunContext.new(), fetch=fetch_ok, judge=judge_returning("not_relevant", None)
         )
     )
     assert [r.event.event_id for r in results] == ["gkg-123", "gkg-456"]
+
+
+def test_rubric_maps_to_verdict_and_scope(event, site):
+    request = VerificationRequest(event=event, site=site)
+    quote = "The strike has halted all container handling."
+    direct = verify(request, fetch_ok, judge_returning("direct", quote))
+    indirect = verify(request, fetch_ok, judge_returning("indirect", quote))
+    unrelated = verify(request, fetch_ok, judge_returning("not_relevant", None))
+    unreadable = verify(request, fetch_ok, judge_returning("unverifiable", None))
+    assert (direct.verdict, direct.scope) == (Verdict.YES, Scope.DIRECT)
+    assert (indirect.verdict, indirect.scope) == (Verdict.YES, Scope.INDIRECT)
+    assert (unrelated.verdict, unrelated.scope) == (Verdict.NO, Scope.NOT_RELEVANT)
+    assert (unreadable.verdict, unreadable.scope) == (Verdict.UNVERIFIABLE, None)
+
+
+def test_indirect_with_invented_quote_is_downgraded(event, site):
+    judge = judge_returning("indirect", "The river is closed.")
+    result = verify(VerificationRequest(event=event, site=site), fetch_ok, judge)
+    assert result.verdict is Verdict.UNVERIFIABLE and result.scope is None

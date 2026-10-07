@@ -17,12 +17,16 @@ class FakeTool:
     def __init__(self, tables: dict[str, list[dict]]):
         self.tables = tables
         self.bytes_processed = 0
+        self.statements: list[str] = []
 
     def fork(self):
         return self
 
     def run_query(self, sql, params=None):
         self.bytes_processed += 100
+        self.statements.append(sql)
+        if "@org_pattern" in sql:  # the entity retrieval path
+            return self.tables.get("entity", [])
         for name, rows in self.tables.items():
             if f".scrm.{name}`" in sql:
                 return rows
@@ -55,6 +59,7 @@ def gkg_row(gkg_id, url, themes="", tone=0.0, distance_km=25.0, place="Rotterdam
         "tone": tone,
         "place": place,
         "distance_km": distance_km,
+        "source": "x.example",
     }
 
 
@@ -163,15 +168,15 @@ def test_run_merges_both_tables_and_skips_bad_urls(date_range):
     result = asyncio.run(query_agent.run(request, RunContext.new(), tool=tool))
     assert [e.event_id for e in result.events] == ["g1", "7"]
     assert {e.source_table for e in result.events} == {"gkg_near_sites", "events_near_sites"}
-    assert result.bytes_processed == 300
-    assert len(result.sql) == 3
+    assert result.bytes_processed == 400  # sites, gkg, events, entity path
+    assert len(result.sql) == 4
 
 
 def test_preloaded_sites_skip_the_sites_query(date_range):
     tool = FakeTool({"gkg_near_sites": [], "events_near_sites": []})
     request = QueryRequest(site_ids=["P05"], date_range=date_range)
     result = asyncio.run(query_agent.run(request, RunContext.new(), tool=tool, sites=[SITE]))
-    assert result.events == [] and len(result.sql) == 2
+    assert result.events == [] and len(result.sql) == 3
 
 
 def test_unknown_site_is_an_error():
@@ -181,3 +186,40 @@ def test_unknown_site_is_an_error():
 
 def test_empty_site_list_loads_all_sites():
     assert query_agent.load_sites(FakeTool({"sites": [SITE_ROW]}), []) == [SITE]
+
+
+def test_entity_path_adds_company_articles_from_other_sites(date_range):
+    tsmc = SITE.model_copy(
+        update={"site_id": "S01", "site_name": "TSMC Hsinchu fabs", "company": "TSMC"}
+    )
+    row = gkg_row("e1", "https://x.example/tsmc-fab-outage-halts-output", distance_km=3)
+    row["organizations"] = "Taiwan Semiconductor Manufacturing Co,10"
+    tool = FakeTool({"gkg_near_sites": [], "events_near_sites": [], "entity": [row]})
+    request = QueryRequest(site_ids=["S01"], date_range=date_range)
+    result = asyncio.run(query_agent.run(request, RunContext.new(), tool=tool, sites=[tsmc]))
+    (event,) = result.events
+    assert event.retrieval == "entity"
+    assert event.matched_entities == ["Taiwan Semiconductor Manufacturing Co"]
+    assert event.distance_km is None  # distance was to another site
+    assert event.title == "tsmc fab outage halts output"
+
+
+def test_entity_match_is_a_strong_ranking_signal():
+    tsmc = SITE.model_copy(
+        update={"site_id": "S01", "site_name": "TSMC Hsinchu fabs", "company": "TSMC"}
+    )
+    named = gkg_row("a", "https://x.example/a-story", distance_km=40)
+    named["organizations"] = "Tsmc,1"
+    nearby = gkg_row("b", "https://x.example/b-story", distance_km=1)
+    named_c = query_agent.candidate_from_gkg(named, tsmc)
+    nearby_c = query_agent.candidate_from_gkg(nearby, tsmc)
+    assert named_c.signals.site == 1.0 and nearby_c.signals.site == 0.0
+    assert named_c.event.relevance > nearby_c.event.relevance
+
+
+def test_site_without_aliases_skips_the_entity_query(date_range):
+    unnamed = SITE.model_copy(update={"site_id": "X99", "site_name": "Somewhere", "company": None})
+    tool = FakeTool({"gkg_near_sites": [], "events_near_sites": []})
+    request = QueryRequest(site_ids=["X99"], date_range=date_range)
+    asyncio.run(query_agent.run(request, RunContext.new(), tool=tool, sites=[unnamed]))
+    assert not any("@org_pattern" in sql for sql in tool.statements)

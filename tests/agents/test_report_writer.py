@@ -139,7 +139,8 @@ def test_item_citing_another_sites_finding_is_dropped(event, site, date_range):
 
 def test_coverage_table_counts_verdicts_and_articles(event, site, date_range):
     brief = write(make_request(event, site, date_range), drafter([]))
-    assert f"| {site.site_id} {site.site_name} | 4 | 5 | 2 | 1 | 1 |" in brief.markdown
+    # Candidates defaults to stories checked when triage counts are not given.
+    assert f"| {site.site_id} {site.site_name} | 4 | 4 | 0 | 0 | 1 | 1 |" in brief.markdown
 
 
 def test_no_confirmed_events_skips_the_model(event, site, date_range):
