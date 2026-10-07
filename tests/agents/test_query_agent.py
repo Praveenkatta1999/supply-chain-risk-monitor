@@ -4,7 +4,7 @@ from datetime import date
 import pytest
 
 from scrm.agents import query_agent
-from scrm.schemas import Event, QueryRequest
+from scrm.schemas import QueryRequest, Site
 from scrm.telemetry import RunContext
 
 
@@ -17,6 +17,9 @@ class FakeTool:
     def __init__(self, tables: dict[str, list[dict]]):
         self.tables = tables
         self.bytes_processed = 0
+
+    def fork(self):
+        return self
 
     def run_query(self, sql, params=None):
         self.bytes_processed += 100
@@ -38,16 +41,19 @@ SITE_ROW = {
     "lon": 4.14,
     "radius_km": 50,
 }
+SITE = Site.model_validate(SITE_ROW)
+KINDERDIJK = "Kinderdijk, Zuid-Holland, Netherlands"
 
 
-def gkg_row(gkg_id, url, themes="", tone=0.0, distance_km=25.0):
+def gkg_row(gkg_id, url, themes="", tone=0.0, distance_km=25.0, place="Rotterdam", day=10):
     return {
         "gkg_id": gkg_id,
-        "event_date": date(2026, 9, 10),
+        "event_date": date(2026, 9, day),
         "url": url,
         "themes": themes,
         "organizations": "Port Authority,12;Port Authority,40",
         "tone": tone,
+        "place": place,
         "distance_km": distance_km,
     }
 
@@ -60,6 +66,7 @@ def coded_row(event_id, url, root="14", tone=-5.0, distance_km=10.0):
         "actor2": None,
         "event_root_code": root,
         "avg_tone": tone,
+        "place": "Rotterdam",
         "distance_km": distance_km,
         "source_url": url,
     }
@@ -73,46 +80,70 @@ def test_parse_gdelt_list_strips_offsets_and_dedupes():
     assert query_agent.parse_gdelt_list(None) == []
 
 
-def test_component_scores_are_bounded():
-    assert query_agent.theme_score(["WB_167_PORTS", "STRIKE", "MARITIME"]) == 1.0
-    assert query_agent.theme_score(["EDUCATION"]) == 0.0
-    assert query_agent.tone_score(-20) == 1.0
-    assert query_agent.tone_score(3) == 0.0
-    assert query_agent.distance_score(0, 50) == 1.0
-    assert query_agent.distance_score(60, 50) == 0.0
-
-
 def test_port_themes_negative_tone_and_proximity_rank_higher():
-    site = query_agent.Site.model_validate(SITE_ROW)
-    strike = query_agent.event_from_gkg(
-        gkg_row("a", "https://x.example/strike", "STRIKE,1;WB_167_PORTS,2", -6, 5), site
+    strike = query_agent.candidate_from_gkg(
+        gkg_row("a", "https://x.example/strike", "STRIKE,1;WB_167_PORTS,2", -6, 5), SITE
     )
-    school = query_agent.event_from_gkg(
-        gkg_row("b", "https://x.example/school", "EDUCATION,1", -1, 45), site
+    school = query_agent.candidate_from_gkg(
+        gkg_row("b", "https://x.example/school", "EDUCATION,1", -1, 45), SITE
     )
-    assert strike.relevance > school.relevance
+    assert strike.event.relevance > school.event.relevance
 
 
-def make_event(event_id: str, url: str, relevance: float) -> Event:
-    return Event(
-        event_id=event_id,
-        source_table="gkg_near_sites",
-        site_id="P05",
-        event_date=date(2026, 9, 10),
-        source_url=url,
-        relevance=relevance,
+def test_articles_naming_the_site_outrank_ones_only_inside_the_radius():
+    named = query_agent.candidate_from_gkg(
+        gkg_row("a", "https://x.example/staking-in-de-rotterdamse-haven", distance_km=30), SITE
     )
+    nearby = query_agent.candidate_from_gkg(
+        gkg_row("b", "https://x.example/drugs-arrest-in-russia", distance_km=5), SITE
+    )
+    assert named.signals.site == 1.0 and nearby.signals.site == 0.0
+    assert named.event.relevance > nearby.event.relevance
 
 
-def test_rank_and_dedupe_keeps_best_row_per_url_and_limits():
-    events = [
-        make_event("low", "https://x.example/same", 0.2),
-        make_event("high", "https://x.example/same", 0.9),
-        make_event("other", "https://x.example/other", 0.5),
-        make_event("third", "https://x.example/third", 0.1),
+def test_cluster_and_rank_keeps_one_representative_per_story():
+    slug = "schepen-botsen-op-elkaar-bij-kinderdijk-flinke-schade"
+    rows = [
+        gkg_row("k1", f"https://a.example/{slug}", "MARITIME,1", -4, 30, KINDERDIJK),
+        gkg_row("k2", f"https://b.example/{slug}-xq", "MARITIME,1", -3, 30, KINDERDIJK, day=11),
+        gkg_row("k3", f"https://c.example/{slug}", "MARITIME,1", -2, 30, KINDERDIJK, day=12),
+        gkg_row("dup", f"https://a.example/{slug}", "", 0, 49, KINDERDIJK),  # same URL as k1
+        gkg_row("other", "https://d.example/unrelated-story-about-tulips"),
     ]
-    top = query_agent.rank_and_dedupe(events, limit=2)
-    assert [e.event_id for e in top] == ["high", "other"]
+    events = query_agent.cluster_and_rank(
+        [query_agent.candidate_from_gkg(r, SITE) for r in rows], limit=20
+    )
+    story = next(e for e in events if e.cluster_size == 3)
+    assert story.event_id == "k1"  # best-scoring member represents the cluster
+    assert [str(u) for u in story.supporting_urls] == [
+        f"https://b.example/{slug}-xq",
+        f"https://c.example/{slug}",
+    ]
+    assert len(events) == 2
+
+
+def test_cluster_size_counts_toward_relevance():
+    slug = "rhine-water-levels-fall-to-new-record-low"
+    lone = query_agent.candidate_from_gkg(
+        gkg_row("x", f"https://a.example/{slug}", "MARITIME,1"), SITE
+    )
+    copies = [
+        query_agent.candidate_from_gkg(
+            gkg_row(f"c{i}", f"https://p{i}.example/{slug}-{w}", "MARITIME,1"), SITE
+        )
+        for i, w in enumerate(["barges", "fuel", "shipping", "drought"])
+    ]
+    clustered = query_agent.cluster_and_rank(copies, limit=1)[0]
+    assert clustered.cluster_size == 4
+    assert clustered.relevance > lone.event.relevance
+
+
+def test_limit_applies_to_clusters():
+    rows = [gkg_row(f"g{i}", f"https://x.example/story-number-{w}") for i, w in enumerate("abc")]
+    events = query_agent.cluster_and_rank(
+        [query_agent.candidate_from_gkg(r, SITE) for r in rows], limit=2
+    )
+    assert len(events) == 2
 
 
 def test_run_merges_both_tables_and_skips_bad_urls(date_range):
@@ -120,7 +151,9 @@ def test_run_merges_both_tables_and_skips_bad_urls(date_range):
         {
             "sites": [SITE_ROW],
             "gkg_near_sites": [
-                gkg_row("g1", "https://x.example/port", "WB_167_PORTS,1", -5, 5),
+                gkg_row(
+                    "g1", "https://x.example/port-of-rotterdam-closed", "WB_167_PORTS,1", -5, 5
+                ),
                 gkg_row("g2", "not a url"),
             ],
             "events_near_sites": [coded_row(7, "https://x.example/protest")],
@@ -134,6 +167,17 @@ def test_run_merges_both_tables_and_skips_bad_urls(date_range):
     assert len(result.sql) == 3
 
 
+def test_preloaded_sites_skip_the_sites_query(date_range):
+    tool = FakeTool({"gkg_near_sites": [], "events_near_sites": []})
+    request = QueryRequest(site_ids=["P05"], date_range=date_range)
+    result = asyncio.run(query_agent.run(request, RunContext.new(), tool=tool, sites=[SITE]))
+    assert result.events == [] and len(result.sql) == 2
+
+
 def test_unknown_site_is_an_error():
     with pytest.raises(ValueError, match="unknown site_ids"):
         query_agent.load_sites(FakeTool({"sites": []}), ["NOPE"])
+
+
+def test_empty_site_list_loads_all_sites():
+    assert query_agent.load_sites(FakeTool({"sites": [SITE_ROW]}), []) == [SITE]

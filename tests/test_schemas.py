@@ -55,3 +55,28 @@ def test_yes_verdict_requires_a_quote(event):
     with pytest.raises(ValidationError, match="quote"):
         VerifiedEvent(**common, verdict=Verdict.YES)
     VerifiedEvent(**common, verdict=Verdict.UNVERIFIABLE)
+
+
+def test_brief_item_risk_is_severity_times_impact():
+    item = BriefItem(site_id="s", claim="c", severity=3, impact=4, source_urls=["https://a.x/"])
+    assert item.risk == 12
+    unscored = BriefItem(site_id="s", claim="c", source_urls=["https://a.x/"])
+    assert unscored.risk == 0
+
+
+def test_brief_markdown_must_link_supporting_sources(date_range):
+    item = BriefItem(
+        site_id="s",
+        claim="c",
+        source_urls=["https://example.com/a"],
+        supporting_urls=["https://example.com/b"],
+    )
+    common = dict(
+        run_id="r1",
+        generated_at=datetime.now(UTC),
+        date_range=date_range,
+        site_ids=["s"],
+        items=[item],
+    )
+    with pytest.raises(ValidationError, match=r"example.com/b"):
+        RiskBrief(**common, markdown="- c ([source](https://example.com/a))")

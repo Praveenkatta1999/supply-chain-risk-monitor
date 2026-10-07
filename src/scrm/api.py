@@ -29,8 +29,8 @@ async def create_brief(request: BriefRequest) -> RiskBrief:
         log.info("brief.requested", extra={"site_ids": request.site_ids})
         try:
             return await orchestrator.run(request, ctx)
-        except NotImplementedError as exc:
+        except ValueError as exc:  # e.g. unknown site_ids
             raise HTTPException(
-                status_code=status.HTTP_501_NOT_IMPLEMENTED,
+                status_code=status.HTTP_400_BAD_REQUEST,
                 detail={"run_id": ctx.run_id, "error": str(exc)},
             ) from exc

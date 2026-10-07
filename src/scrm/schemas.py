@@ -66,10 +66,18 @@ class Event(_Model):
     organizations: list[str] = Field(default_factory=list)
     themes: list[str] = Field(default_factory=list)
     tone: float | None = None
+    place: str | None = Field(default=None, description="GDELT's geocoded place name.")
     distance_km: float | None = Field(default=None, ge=0)
     source_url: HttpUrl
     relevance: float | None = Field(
         default=None, ge=0, le=1, description="Ranking score set by query_agent."
+    )
+    cluster_size: int = Field(
+        default=1, ge=1, description="Articles in this story cluster, including this one."
+    )
+    supporting_urls: list[HttpUrl] = Field(
+        default_factory=list,
+        description="Other articles in the same story cluster; not verified individually.",
     )
 
 
@@ -139,9 +147,17 @@ class BriefItem(_Model):
 
     site_id: str
     claim: str = Field(min_length=1)
-    severity: Score | None = None  # None until risk_scorer is implemented
+    severity: Score | None = None
     impact: Score | None = None
-    source_urls: list[HttpUrl] = Field(min_length=1)
+    source_urls: list[HttpUrl] = Field(min_length=1, description="Verified sources.")
+    supporting_urls: list[HttpUrl] = Field(
+        default_factory=list, description="Same-story articles that were not verified."
+    )
+
+    @property
+    def risk(self) -> int:
+        """severity x impact (1..25), 0 if unscored. Used to order the brief."""
+        return (self.severity or 0) * (self.impact or 0)
 
 
 class RiskBrief(_Model):
@@ -156,7 +172,9 @@ class RiskBrief(_Model):
 
     @model_validator(mode="after")
     def _every_source_is_linked(self) -> Self:
-        urls = {str(url) for item in self.items for url in item.source_urls}
+        urls = {
+            str(url) for item in self.items for url in [*item.source_urls, *item.supporting_urls]
+        }
         missing = sorted(url for url in urls if url not in self.markdown)
         if missing:
             raise ValueError(f"markdown is missing source links: {missing}")
@@ -223,14 +241,34 @@ class VerifierJudgement(_Model):
 
     verdict: Verdict
     reason: str = Field(description="One sentence, in English.")
+    # Defaults to None because the model sometimes omits the field instead of sending null.
     quote: str | None = Field(
-        description="A short verbatim excerpt from article_text, in its original language."
+        default=None,
+        description="A short verbatim excerpt from article_text, in its original language.",
     )
 
 
 class ScoringRequest(_Model):
     verified_event: VerifiedEvent
     site: Site
+
+
+class ScorerInput(_Model):
+    """What the risk scorer's LLM sees: the site and the verifier's evidence."""
+
+    site: Site
+    event_date: date
+    reason: str
+    quote: str
+    cluster_size: int
+
+
+class RiskJudgement(_Model):
+    """The risk scorer LLM's structured answer."""
+
+    severity: Score = Field(description="How serious the event is in itself, 1-5.")
+    impact: Score = Field(description="How much it disrupts this specific site, 1-5.")
+    reason: str = Field(description="One sentence, in English.")
 
 
 class ReportRequest(_Model):
@@ -242,13 +280,19 @@ class ReportRequest(_Model):
 
 
 class Finding(_Model):
-    """One confirmed event, as the report writer's LLM sees it."""
+    """One confirmed event, as the report writer's LLM sees it.
 
+    The model cites findings by ``finding_id`` and never sees or copies URLs; Python maps
+    IDs back to sources, so a model cannot cite a URL that was not verified.
+    """
+
+    finding_id: str
     site_id: str
     event_date: date
-    source_url: HttpUrl
     reason: str
     quote: str
+    severity: Score | None = None
+    impact: Score | None = None
 
 
 class ReportDraftInput(_Model):
@@ -260,8 +304,8 @@ class ReportDraftInput(_Model):
 class DraftItem(_Model):
     site_id: str
     claim: str = Field(description="One or two sentences, in English, stating the disruption.")
-    source_urls: list[HttpUrl] = Field(
-        min_length=1, description="source_url values of the findings this claim is based on."
+    finding_ids: list[str] = Field(
+        min_length=1, description="finding_id values of the findings this claim is based on."
     )
 
 
@@ -269,3 +313,21 @@ class ReportDraft(_Model):
     """The report writer LLM's output; Python renders it to Markdown."""
 
     items: list[DraftItem]
+
+
+class SiteRun(_Model):
+    """Everything the pipeline produced for one site, for auditing and evals."""
+
+    site: Site
+    candidates: list[Event]
+    verified_events: list[VerifiedEvent]
+    scores: list[RiskScore]
+    bytes_processed: int = Field(ge=0)
+
+
+class PipelineResult(_Model):
+    """Orchestrator output with the per-site detail behind the brief."""
+
+    brief: RiskBrief
+    site_runs: list[SiteRun]
+    model_calls: dict[str, int] = Field(description="Model calls per agent name.")

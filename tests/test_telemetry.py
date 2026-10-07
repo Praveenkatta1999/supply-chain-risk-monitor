@@ -13,3 +13,14 @@ def test_run_id_is_bound_and_logged():
     assert payload["run_id"] == ctx.run_id
     assert payload["site_count"] == 2
     assert current_run_id() is None
+
+
+def test_model_calls_are_counted_on_the_bound_context():
+    from scrm.telemetry import current_context
+
+    ctx = RunContext.new()
+    with ctx.bind():
+        current_context().record_model_call("verifier")
+        current_context().record_model_call("verifier")
+    assert ctx.model_calls == {"verifier": 2}
+    assert current_context() is None

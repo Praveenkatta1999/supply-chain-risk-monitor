@@ -15,6 +15,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from google.cloud import bigquery
+from google.cloud.bigquery.table import RowIterator
 
 from scrm.config import Settings
 from scrm.telemetry import get_logger
@@ -82,6 +83,10 @@ class BigQueryTool:
             location=settings.bq_location,
         )
 
+    def fork(self) -> "BigQueryTool":
+        """Return a copy sharing the client and limits, with its own bytes counter."""
+        return self.with_max_bytes(self.max_bytes_billed)
+
     def with_max_bytes(self, max_bytes_billed: int) -> "BigQueryTool":
         """Return a copy of this tool, sharing the client, with a different byte limit."""
         return BigQueryTool(
@@ -105,6 +110,17 @@ class BigQueryTool:
 
     def run_query(self, sql: str, params: list[QueryParam] | None = None) -> list[dict[str, Any]]:
         """Dry-run, check guards, then execute and return rows as dicts."""
+        return [dict(row.items()) for row in self.query_rows(sql, params)]
+
+    def query_rows(
+        self, sql: str, params: list[QueryParam] | None = None, *, page_size: int | None = None
+    ) -> RowIterator:
+        """Dry-run, check guards, execute, and return BigQuery's paged row iterator.
+
+        Use this instead of ``run_query`` for large results: pages are fetched lazily, and
+        the iterator can be streamed (for example ``to_arrow_iterable()``) without holding
+        every row in memory.
+        """
         estimate = self.dry_run(sql, params)
         self._check_statement(estimate.statement_type)
         self._check_tables(estimate.referenced_tables)
@@ -120,7 +136,7 @@ class BigQueryTool:
             maximum_bytes_billed=self.max_bytes_billed, query_parameters=params or []
         )
         job = self._client.query(sql, job_config=config, location=self.location)
-        rows = [dict(row.items()) for row in job.result()]
+        rows = job.result(page_size=page_size)  # waits for the job; rows are fetched lazily
         self.bytes_processed += int(job.total_bytes_processed or 0)
         return rows
 

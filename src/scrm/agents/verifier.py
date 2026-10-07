@@ -187,12 +187,15 @@ async def run_many(
     requests: list[VerificationRequest],
     ctx: RunContext,
     *,
-    concurrency: int = DEFAULT_CONCURRENCY,
+    limit: asyncio.Semaphore | None = None,
     fetch: Fetcher = fetch_article,
     judge: Judge = _gemini_judge,
 ) -> list[VerifiedEvent]:
-    """Verify many candidates concurrently, returning results in input order."""
-    semaphore = asyncio.Semaphore(concurrency)
+    """Verify many candidates concurrently, returning results in input order.
+
+    ``limit`` caps how many run at once; pass a shared one to cap work across callers.
+    """
+    semaphore = limit or asyncio.Semaphore(DEFAULT_CONCURRENCY)
 
     async def one(request: VerificationRequest) -> VerifiedEvent:
         async with semaphore:
