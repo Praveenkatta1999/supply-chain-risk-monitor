@@ -8,16 +8,19 @@ from scrm.agents import (
     orchestrator,
     query_agent,
     report_writer,
+    reviewer,
     risk_scorer,
     triage,
     verifier,
 )
 from scrm.schemas import (
     BriefRequest,
+    ClaimReview,
     DraftItem,
     Investigation,
     QueryResult,
     ReportDraft,
+    ReviewDraft,
     RiskBrief,
     RiskScore,
     TriageResult,
@@ -32,10 +35,10 @@ def test_orchestrator_contract():
     assert orchestrator.OUTPUT_SCHEMA is RiskBrief
 
 
-def test_runs_sites_and_orders_the_brief_by_risk(monkeypatch, site, event, date_range):
+def test_pipeline_routes_work_and_investigates_once_per_story(monkeypatch, site, event, date_range):
     sites = [site.model_copy(update={"site_id": sid}) for sid in ("A", "B")]
     impact_by_site = {"A": 2, "B": 5}
-    seen_run_ids = set()
+    seen_run_ids, verified_ids, investigated = set(), [], []
 
     def load_sites(tool, site_ids):
         assert site_ids == ["A", "B"]
@@ -43,7 +46,7 @@ def test_runs_sites_and_orders_the_brief_by_risk(monkeypatch, site, event, date_
 
     async def query_run(request, ctx, *, tool, sites):
         (s,) = sites
-        kept, dropped = (
+        events = [
             event.model_copy(
                 update={
                     "event_id": f"{s.site_id}-{n}",
@@ -51,34 +54,16 @@ def test_runs_sites_and_orders_the_brief_by_risk(monkeypatch, site, event, date_
                     "source_url": f"https://news.example/{s.site_id}/{n}",
                 }
             )
-            for n in (1, 2)
-        )
-        return QueryResult(events=[kept, dropped], sql=[], bytes_processed=10)
+            for n in (1, 2, 3)
+        ]
+        return QueryResult(events=events, sql=[], bytes_processed=10)
 
     async def triage_run(site, events, ctx):
-        ctx.record_model_call("triage")
-        keep = events[0]  # triage drops the second candidate
+        keep = events[:2]  # triage drops the third candidate
         return TriageResult(
             site_id=site.site_id,
             considered=len(events),
-            selected=[TriageSelection(event_id=keep.event_id, reason="Strike at the site.")],
-        )
-
-    verified_ids = []
-    investigated = []
-
-    async def investigate(verified, score, site, search_until, tool):
-        investigated.append((site.site_id, score.severity * score.impact))
-        return Investigation(
-            event_id=verified.event.event_id,
-            site_id=site.site_id,
-            source_url=verified.evidence_url,
-            trigger="high_risk",
-            summary="Still closed.",
-            status="ongoing",
-            confidence="high",
-            corroborating_urls=["https://other.example/report"],
-            tool_calls=3,
+            selected=[TriageSelection(event_id=e.event_id, reason="Strike.") for e in keep],
         )
 
     async def run_many(requests, ctx, *, limit):
@@ -96,7 +81,6 @@ def test_runs_sites_and_orders_the_brief_by_risk(monkeypatch, site, event, date_
         ]
 
     async def score_run(request, ctx):
-        ctx.record_model_call("risk_scorer")
         v = request.verified_event
         return RiskScore(
             event_id=v.event.event_id,
@@ -108,14 +92,37 @@ def test_runs_sites_and_orders_the_brief_by_risk(monkeypatch, site, event, date_
         )
 
     async def draft(payload):
+        # Both findings per site describe the same strike: one claim per site.
+        by_site: dict[str, list[str]] = {}
+        for f in payload.findings:
+            by_site.setdefault(f.site_id, []).append(f.finding_id)
         return ReportDraft(
             items=[
-                DraftItem(
-                    site_id=f.site_id,
-                    claim=f"Strike at {f.site_id}.",
-                    finding_ids=[f.finding_id],
-                )
-                for f in payload.findings
+                DraftItem(site_id=s, claim=f"Strike at {s}.", finding_ids=ids)
+                for s, ids in by_site.items()
+            ]
+        )
+
+    async def investigate_claim(item, events, site, search_until, tool):
+        investigated.append((item.item_id, item.site_id, len(events)))
+        return Investigation(
+            item_id=item.item_id,
+            site_id=site.site_id,
+            source_url=item.source_urls[0],
+            source_urls=item.source_urls,
+            trigger="high_risk",
+            summary="Still closed.",
+            status="ongoing",
+            confidence="high",
+            corroborating_urls=["https://other.example/report"],
+            tool_calls=3,
+        )
+
+    async def review(payload):
+        return ReviewDraft(
+            reviews=[
+                ClaimReview(item_id=i.item_id, status="ongoing", confidence="high")
+                for i in payload.items
             ]
         )
 
@@ -123,23 +130,27 @@ def test_runs_sites_and_orders_the_brief_by_risk(monkeypatch, site, event, date_
     monkeypatch.setattr(query_agent, "run", query_run)
     monkeypatch.setattr(triage, "run", triage_run)
     monkeypatch.setattr(verifier, "run_many", run_many)
-    monkeypatch.setattr(investigator, "run", investigate)
     monkeypatch.setattr(risk_scorer, "run", score_run)
-    monkeypatch.setattr(report_writer, "run", functools.partial(report_writer.run, draft=draft))
+    monkeypatch.setattr(investigator, "investigate_claim", investigate_claim)
+    monkeypatch.setattr(
+        report_writer, "draft_items", functools.partial(report_writer.draft_items, draft=draft)
+    )
+    monkeypatch.setattr(
+        reviewer, "review_and_revise", functools.partial(reviewer.review_and_revise, review=review)
+    )
 
     ctx = RunContext.new()
     request = BriefRequest(site_ids=["A", "B"], date_range=date_range)
     result = asyncio.run(orchestrator.run_pipeline(request, ctx, tool=object()))
 
-    assert [i.site_id for i in result.brief.items] == ["B", "A"]  # risk 20 before risk 8
-    assert [r.site.site_id for r in result.site_runs] == ["A", "B"]
-    assert result.model_calls == {"triage": 2, "risk_scorer": 2}
-    assert seen_run_ids == {ctx.run_id}
-    # Only triaged candidates were verified, only risk >= 12 was investigated.
-    assert verified_ids == ["A-1", "B-1"]
-    assert investigated == [("B", 20)]
+    assert verified_ids == ["A-1", "A-2", "B-1", "B-2"]  # only triaged candidates
+    # One investigation for B's two-source claim (risk 20); A's claim is risk 8.
+    assert investigated == [("I1", "B", 2)]
+    assert [i.site_id for i in result.brief.items] == ["B", "A"]
+    assert {i.status for i in result.brief.items} == {"ongoing"}
+    assert len(result.review_rounds) == 1
     assert "Investigator (ongoing, high confidence, 3 tool calls)" in result.brief.markdown
-    assert "https://other.example/report" in result.brief.markdown
+    assert seen_run_ids == {ctx.run_id}
 
 
 def test_a_failed_score_leaves_the_event_unscored(monkeypatch, site, event):

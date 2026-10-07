@@ -5,7 +5,8 @@ Usage:
         [--end 2026-10-05] [--compare RUN_ID]
 
 Logs (JSON, one line per event, all carrying the run ID) go to stderr. The Markdown brief,
-per-site verification numbers, investigations and model calls go to stdout; --compare
+per-site verification numbers, investigations, review rounds and model calls go
+to stdout; --compare
 also prints the same numbers for an earlier saved run. The full result is saved to
 data/runs/<run_id>.json for evals (scripts/add_eval_cases.py).
 """
@@ -70,14 +71,31 @@ def print_verification(result: PipelineResult, label: str) -> None:
 
 
 def print_investigations(result: PipelineResult) -> None:
-    investigations = [i for r in result.site_runs for i in r.investigations]
+    # Older runs stored investigations per site; newer runs store them once per story.
+    per_site = [i for r in result.site_runs for i in r.investigations]
+    investigations = [*result.investigations, *per_site]
     print(f"\n## Investigations: {len(investigations)}\n")
     for inv in investigations:
+        subject = f"claim {inv.item_id}" if inv.item_id else f"story {inv.event_id}"
         print(
-            f"- {inv.site_id} [{inv.trigger}] {inv.status}, {inv.confidence} confidence, "
-            f"{inv.tool_calls} tool calls, {len(inv.corroborating_urls)} corroborating"
-            f"{' (hit limit)' if inv.hit_limit else ''}\n  {inv.source_url}\n  {inv.summary}"
+            f"- {inv.site_id} {subject} [{inv.trigger}] {inv.status}, {inv.confidence} "
+            f"confidence, {inv.tool_calls} tool calls, {len(inv.corroborating_urls)} "
+            f"corroborating{' (hit limit)' if inv.hit_limit else ''}\n  {inv.summary}"
         )
+
+
+def print_review(result: PipelineResult) -> None:
+    print(f"\n## Review rounds: {len(result.review_rounds)}\n")
+    for rnd in result.review_rounds:
+        flagged = sum(bool(r.contradicted) for r in rnd.reviews)
+        revised = ", ".join(rnd.revised_item_ids) or "none"
+        print(
+            f"- Round {rnd.round}: {len(rnd.reviews)} claims reviewed, {flagged} with "
+            f"contradictions, sent back for revision: {revised}"
+        )
+        for r in rnd.reviews:
+            for c in r.corrections:
+                print(f"  - {r.item_id}: {c}")
 
 
 def load_run(run_id: str) -> PipelineResult:
@@ -88,6 +106,8 @@ def load_run(run_id: str) -> PipelineResult:
 
 async def main(argv: list[str]) -> int:
     args = parse_args(argv)
+    # Claims can quote any language; don't depend on the console's code page.
+    sys.stdout.reconfigure(encoding="utf-8")
     configure_logging(get_settings().log_level)
     ctx = RunContext.new()
     end = args.end or datetime.now(UTC).date()
@@ -106,6 +126,7 @@ async def main(argv: list[str]) -> int:
     if args.compare:
         print_verification(load_run(args.compare), f"earlier run ({args.compare})")
     print_investigations(result)
+    print_review(result)
     print(f"\nBigQuery bytes processed: {sum(r.bytes_processed for r in result.site_runs):,}")
     print(f"Run ID: {ctx.run_id}. Full result saved to {saved}")
     return 0

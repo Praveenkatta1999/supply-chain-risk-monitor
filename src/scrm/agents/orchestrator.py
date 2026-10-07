@@ -1,30 +1,43 @@
 """Orchestrator: takes a site list and date range, routes work, assembles the brief.
 
-Pipeline, per site and with sites running concurrently:
+Pipeline. Per site, with sites running concurrently:
     query_agent    up to 50 ranked story clusters (location and entity retrieval)
     triage         one model call: which stories are plausibly a disruption here
     verifier       reads one article per triaged story: direct / indirect / not relevant
     risk_scorer    severity and impact for confirmed stories
-    investigator   corroborates findings with risk >= 12, and unverifiable ones
-then once for all sites:
-    report_writer  one brief: direct findings first, then indirect, then investigated
-                   unverifiable stories; each section ordered by risk
+Then once, for all sites together:
+    report_writer  drafts claims, merging findings about the same event (I1, I2, ...)
+    investigator   once per story: each claim with risk >= 12, each unverifiable story
+    reviewer       critic loop: checks claims against the evidence, sends corrections
+                   back to the report writer (at most 2 rounds), sets status/confidence
+    report_writer  renders the brief: direct, indirect, investigated unverifiable stories
 
-The orchestrator is deterministic Python rather than an LLM: the order of steps is fixed,
-so letting a model choose it would add cost and non-determinism without benefit. Every
-step runs inside the caller's RunContext, so one run ID flows through all logs and model
-calls are counted per agent. Model work across all sites shares one concurrency limit.
+Investigating after claims are drafted means one investigation per story, however many
+articles the story was built from. The orchestrator is deterministic Python rather than
+an LLM: the order of steps is fixed, so letting a model choose it would add cost and
+non-determinism without benefit. Every step runs inside the caller's RunContext, so one
+run ID flows through all logs and model calls are counted per agent. Model work across
+all sites shares one concurrency limit.
 
 Input:  BriefRequest
-Output: RiskBrief (``run_pipeline`` also returns the per-site detail behind it)
+Output: RiskBrief (``run_pipeline`` also returns the detail behind it)
 """
 
 import asyncio
 from datetime import date
 
-from scrm.agents import investigator, query_agent, report_writer, risk_scorer, triage, verifier
+from scrm.agents import (
+    investigator,
+    query_agent,
+    report_writer,
+    reviewer,
+    risk_scorer,
+    triage,
+    verifier,
+)
 from scrm.config import get_settings
 from scrm.schemas import (
+    BriefItem,
     BriefRequest,
     DateRange,
     Event,
@@ -80,28 +93,6 @@ async def _score_confirmed(
     return [s for s in scores if s is not None]
 
 
-async def _investigate(
-    verified: list[VerifiedEvent],
-    scores: list[RiskScore],
-    site: Site,
-    search_until: date,
-    tool: BigQueryTool,
-    limit: asyncio.Semaphore,
-) -> list[Investigation]:
-    by_url = {str(s.source_url): s for s in scores}
-
-    async def one(event: VerifiedEvent) -> Investigation | None:
-        async with limit:
-            score = by_url.get(str(event.evidence_url))
-            return await investigator.run(event, score, site, search_until, tool)
-
-    todo = [
-        v for v in verified if investigator.needs_investigation(v, by_url.get(str(v.evidence_url)))
-    ]
-    results = await asyncio.gather(*(one(v) for v in todo))
-    return [r for r in results if r is not None]
-
-
 async def _run_site(
     site: Site,
     date_range: DateRange,
@@ -122,7 +113,6 @@ async def _run_site(
         [VerificationRequest(event=e, site=site) for e in to_verify], ctx, limit=limit
     )
     scores = await _score_confirmed(verified, site, ctx, limit)
-    investigations = await _investigate(verified, scores, site, date_range.end, tool, limit)
     log.info(
         "orchestrator.site_done",
         extra={
@@ -130,7 +120,6 @@ async def _run_site(
             "candidates": len(query.events),
             "triaged_in": len(to_verify),
             "confirmed": len(scores),
-            "investigated": len(investigations),
         },
     )
     return SiteRun(
@@ -139,15 +128,43 @@ async def _run_site(
         triage=triaged,
         verified_events=verified,
         scores=scores,
-        investigations=investigations,
         bytes_processed=query.bytes_processed,
     )
+
+
+async def _investigate(
+    items: list[BriefItem],
+    unverifiable: list[VerifiedEvent],
+    events: reviewer.EventIndex,
+    sites: dict[str, Site],
+    search_until: date,
+    tool: BigQueryTool,
+    limit: asyncio.Semaphore,
+) -> list[Investigation]:
+    """One investigation per high-risk claim and per unverifiable story, concurrently."""
+
+    async def claim(item: BriefItem) -> Investigation | None:
+        async with limit:
+            return await investigator.investigate_claim(
+                item, reviewer.sources_of(item, events), sites[item.site_id], search_until, tool
+            )
+
+    async def story(event: VerifiedEvent) -> Investigation | None:
+        async with limit:
+            return await investigator.investigate_story(
+                event, sites[event.event.site_id], search_until, tool
+            )
+
+    jobs = [claim(i) for i in items if investigator.needs_investigation(i)]
+    jobs += [story(v) for v in unverifiable]
+    results = await asyncio.gather(*jobs)
+    return [r for r in results if r is not None]
 
 
 async def run_pipeline(
     request: BriefRequest, ctx: RunContext, *, tool: BigQueryTool | None = None
 ) -> PipelineResult:
-    """Run the full pipeline and return the brief with the per-site detail behind it."""
+    """Run the full pipeline and return the brief with the detail behind it."""
     tool = tool or BigQueryTool.from_settings(get_settings())
     limit = asyncio.Semaphore(MAX_CONCURRENT_MODEL_CALLS)
     with ctx.bind():
@@ -156,23 +173,45 @@ async def run_pipeline(
         site_runs = await asyncio.gather(
             *(_run_site(site, request.date_range, ctx, tool, limit) for site in sites)
         )
-        brief = await report_writer.run(
-            ReportRequest(
-                run_id=ctx.run_id,
-                date_range=request.date_range,
-                sites=sites,
-                verified_events=[v for r in site_runs for v in r.verified_events],
-                scores=[s for r in site_runs for s in r.scores],
-                investigations=[i for r in site_runs for i in r.investigations],
-                considered={r.site.site_id: len(r.candidates) for r in site_runs},
-            ),
-            ctx,
+        verified = [v for r in site_runs for v in r.verified_events]
+        report = ReportRequest(
+            run_id=ctx.run_id,
+            date_range=request.date_range,
+            sites=sites,
+            verified_events=verified,
+            scores=[s for r in site_runs for s in r.scores],
+            considered={r.site.site_id: len(r.candidates) for r in site_runs},
         )
+        items = await report_writer.draft_items(report, ctx)
+        events = reviewer.index_events(verified)
+        investigations = await _investigate(
+            items,
+            [v for v in verified if v.verdict is Verdict.UNVERIFIABLE],
+            events,
+            {s.site_id: s for s in sites},
+            request.date_range.end,
+            tool,
+            limit,
+        )
+        items, rounds = await reviewer.review_and_revise(items, events, investigations, ctx)
+        report = report.model_copy(update={"investigations": investigations})
+        brief = report_writer.render(report, items)
         log.info(
             "orchestrator.done",
-            extra={"items": len(brief.items), "model_calls": dict(ctx.model_calls)},
+            extra={
+                "items": len(brief.items),
+                "investigations": len(investigations),
+                "review_rounds": len(rounds),
+                "model_calls": dict(ctx.model_calls),
+            },
         )
-        return PipelineResult(brief=brief, site_runs=site_runs, model_calls=dict(ctx.model_calls))
+        return PipelineResult(
+            brief=brief,
+            site_runs=site_runs,
+            investigations=investigations,
+            review_rounds=rounds,
+            model_calls=dict(ctx.model_calls),
+        )
 
 
 async def run(request: BriefRequest, ctx: RunContext) -> RiskBrief:
