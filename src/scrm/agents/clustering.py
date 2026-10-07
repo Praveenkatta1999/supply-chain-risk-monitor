@@ -47,15 +47,28 @@ class Item:
     day: date
 
 
-def slug_tokens(url: str) -> frozenset[str]:
-    """Distinctive words from the URL path segment that looks most like a headline."""
+def _headline_words(url: str) -> list[str]:
+    """All words of the URL path segment that looks most like a headline."""
     segments = [s for s in urlsplit(url).path.split("/") if s]
     best: list[str] = []
     for segment in segments:
         words = [w for w in re.split(r"[^a-z]+", segment.lower().rsplit(".", 1)[0]) if w]
         if len(words) > len(best):
             best = words
-    return frozenset(w for w in best if len(w) >= MIN_TOKEN_LENGTH and w not in STOPWORDS)
+    return best
+
+
+def slug_tokens(url: str) -> frozenset[str]:
+    """Distinctive words from the URL's headline segment, for comparing stories."""
+    words = _headline_words(url)
+    return frozenset(w for w in words if len(w) >= MIN_TOKEN_LENGTH and w not in STOPWORDS)
+
+
+def slug_title(url: str) -> str | None:
+    """A readable stand-in for the headline ("rhine water levels fall ..."), if any."""
+    words = _headline_words(url)
+    real_words = [w for w in words if len(w) >= MIN_TOKEN_LENGTH]  # not hex IDs like "f a bf"
+    return " ".join(words) if len(real_words) >= MIN_SHARED_TOKENS else None
 
 
 def independent_reports(urls: list[str]) -> int:

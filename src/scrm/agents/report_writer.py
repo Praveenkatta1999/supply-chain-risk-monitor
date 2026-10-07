@@ -26,10 +26,12 @@ from scrm.config import Settings, get_settings
 from scrm.schemas import (
     BriefItem,
     Finding,
+    Investigation,
     ReportDraft,
     ReportDraftInput,
     ReportRequest,
     RiskBrief,
+    Scope,
     Site,
     Verdict,
     VerifiedEvent,
@@ -51,7 +53,8 @@ verbatim quote (possibly not in English) from the source article.
 
 Write one item per distinct disruption, covering every finding:
 - If several findings for the SAME site describe the same underlying event, merge them
-  into one item. Never merge findings across sites, or findings about different events.
+  into one item. Never merge findings across sites, findings about different events, or a
+  "direct" finding with an "indirect" one (scope says which each finding is).
 - claim: one or two plain English sentences saying what is happening and why it matters
   for the site. Use only facts present in the findings; do not add numbers, dates or
   causes that are not there.
@@ -93,6 +96,7 @@ def gather_evidence(request: ReportRequest) -> Evidence:
         finding = Finding(
             finding_id=f"F{n}",
             site_id=v.event.site_id,
+            scope=v.scope,
             event_date=v.event.event_date,
             reason=v.reason,
             quote=v.quote or "",
@@ -107,9 +111,13 @@ def _brief_item(site_id: str, claim: str, cited: list[tuple[Finding, VerifiedEve
     """Build an item whose sources, supporting links and scores all come from ``cited``."""
     worst, _ = max(cited, key=lambda fv: (fv[0].severity or 0) * (fv[0].impact or 0))
     supporting = dict.fromkeys(u for _, v in cited for u in v.event.supporting_urls)
+    scopes = {f.scope for f, _ in cited}
+    # A claim built on any direct finding is direct; scope is None only for legacy runs.
+    scope = Scope.DIRECT if Scope.DIRECT in scopes else next(iter(scopes - {None}), None)
     return BriefItem(
         site_id=site_id,
         claim=claim,
+        scope=scope,
         severity=worst.severity,
         impact=worst.impact,
         source_urls=[v.evidence_url for _, v in cited],
@@ -146,7 +154,19 @@ def _links(urls: list, label: str) -> str:
     return ", ".join(f"[{label} {n}]({url})" for n, url in enumerate(urls, 1))
 
 
-def _render_item(rank: int, item: BriefItem, site: Site) -> list[str]:
+def _investigation_line(inv: Investigation) -> str:
+    line = (
+        f"   Investigator ({inv.status}, {inv.confidence} confidence, "
+        f"{inv.tool_calls} tool calls): {inv.summary}"
+    )
+    if inv.corroborating_urls:
+        line += f" Corroborating: {_links(inv.corroborating_urls, 'c')}."
+    return line
+
+
+def _render_item(
+    rank: int, item: BriefItem, site: Site, investigations: dict[str, Investigation]
+) -> list[str]:
     score = (
         f"severity {item.severity}, impact {item.impact}, risk {item.risk}/25"
         if item.severity
@@ -158,45 +178,91 @@ def _render_item(rank: int, item: BriefItem, site: Site) -> list[str]:
     ]
     if item.supporting_urls:
         lines.append(f"   Also reported, not verified: {_links(item.supporting_urls, 'link')}")
+    lines += [
+        _investigation_line(investigations[str(url)])
+        for url in item.source_urls
+        if str(url) in investigations
+    ]
+    return lines
+
+
+def _render_unverifiable(request: ReportRequest, sites: dict[str, Site]) -> list[str]:
+    """Stories whose article could not be read, with what the investigator found."""
+    events = {str(v.evidence_url): v for v in request.verified_events}
+    rows = [i for i in request.investigations if i.trigger == "unverifiable"]
+    if not rows:
+        return []
+    lines = [
+        "",
+        "## Unverifiable stories, investigated",
+        "",
+        "Not confirmed: the source article could not be read. Shown with the investigator's",
+        "findings so they can be followed up.",
+        "",
+    ]
+    for inv in rows:
+        site = sites[inv.site_id]
+        title = events[str(inv.source_url)].event.title or "untitled story"
+        lines += [
+            f"- **{site.site_id} {site.site_name}**: {title} ([story]({inv.source_url}))",
+            _investigation_line(inv),
+        ]
     return lines
 
 
 def _coverage_table(request: ReportRequest) -> list[str]:
     lines = [
-        "| Site | Stories checked | Articles covered | Confirmed | Rejected | Unverifiable |",
-        "|---|---|---|---|---|---|",
+        "| Site | Candidates | Sent to verifier | Direct | Indirect | Rejected | Unverifiable |",
+        "|---|---|---|---|---|---|---|",
     ]
     for site in request.sites:
         events = [v for v in request.verified_events if v.event.site_id == site.site_id]
-        counts = Counter(v.verdict for v in events)
-        articles = sum(v.event.cluster_size for v in events)
+        verdicts = Counter(v.verdict for v in events)
+        scopes = Counter(v.scope for v in events)
+        considered = request.considered.get(site.site_id, len(events))
         lines.append(
-            f"| {site.site_id} {site.site_name} | {len(events)} | {articles} "
-            f"| {counts[Verdict.YES]} | {counts[Verdict.NO]} | {counts[Verdict.UNVERIFIABLE]} |"
+            f"| {site.site_id} {site.site_name} | {considered} | {len(events)} "
+            f"| {scopes[Scope.DIRECT]} | {scopes[Scope.INDIRECT]} | {verdicts[Verdict.NO]} "
+            f"| {verdicts[Verdict.UNVERIFIABLE]} |"
         )
+    return lines
+
+
+def _section(
+    title: str,
+    items: list[BriefItem],
+    sites: dict[str, Site],
+    investigations: dict[str, Investigation],
+) -> list[str]:
+    lines = ["", f"## {title}", ""]
+    if not items:
+        return [*lines, "None in this period."]
+    for rank, item in enumerate(items, 1):
+        lines += _render_item(rank, item, sites[item.site_id], investigations)
     return lines
 
 
 def render_markdown(request: ReportRequest, items: list[BriefItem], generated_at: datetime) -> str:
     dr = request.date_range
     sites = {s.site_id: s for s in request.sites}
+    investigations = {str(i.source_url): i for i in request.investigations}
+    direct = [i for i in items if i.scope is not Scope.INDIRECT]  # includes legacy None
+    indirect = [i for i in items if i.scope is Scope.INDIRECT]
     lines = [
         f"# Supply chain risk brief: {dr.start} to {dr.end}",
         "",
         f"Run `{request.run_id}`, generated {generated_at:%Y-%m-%d %H:%M} UTC. "
-        f"Sites: {', '.join(sites)}. Risk = severity x impact, each 1-5.",
-        "",
-        "## Risks, highest first",
-        "",
+        f"Sites: {', '.join(sites)}. Risk = severity x impact, each 1-5, highest first.",
+        *_section("Direct disruptions: the site itself", direct, sites, investigations),
+        *_section(
+            "Indirect disruptions: connected routes and regions", indirect, sites, investigations
+        ),
     ]
-    if not items:
-        lines.append("No confirmed disruptions in this period.")
-    for rank, item in enumerate(items, 1):
-        lines += _render_item(rank, item, sites[item.site_id])
     quiet = [s for s in request.sites if not any(i.site_id == s.site_id for i in items)]
-    if quiet and items:
+    if quiet:
         names = ", ".join(f"{s.site_id} {s.site_name}" for s in quiet)
         lines += ["", f"No confirmed disruptions: {names}."]
+    lines += _render_unverifiable(request, sites)
     lines += ["", "## Coverage", "", *_coverage_table(request)]
     return "\n".join(lines) + "\n"
 

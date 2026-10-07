@@ -1,9 +1,14 @@
 """Offline evaluation of the verifier against human-labelled cases.
 
 Usage:  uv run python -m evals.run_evals [path/to/dataset.jsonl]
+        uv run --env-file .env python -m evals.run_evals --rerun-verifier
 
 Each case is a real candidate from a pipeline run, stored with the verifier's verdict and
 reason at the time, plus a ``human_label`` filled in with ``scripts/label_evals.py``.
+By default the stored verdicts are scored. ``--rerun-verifier`` also runs the current
+verifier (fetching each article again, calling Gemini) on the labelled cases and scores
+that too, so prompt changes can be measured; articles may have changed or gone offline
+since they were first verified.
 
 The positive class is "yes" (a real, current disruption at the site). Only cases the
 human labelled "yes" or "no" are scored; "unsure" and unlabelled cases are skipped.
@@ -12,6 +17,8 @@ it counts as a "no" prediction; coverage reports how often the verifier could ju
 Planned: severity mean absolute error once risk scores are labelled.
 """
 
+import argparse
+import asyncio
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -19,7 +26,7 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
-from scrm.schemas import Event, Verdict
+from scrm.schemas import Event, Site, Verdict, VerificationRequest
 
 DEFAULT_DATASET = Path(__file__).with_name("dataset.jsonl")
 
@@ -169,9 +176,44 @@ def report(cases: list[EvalCase]) -> str:
     return "\n".join(lines)
 
 
+async def rerun_verifier(cases: list[EvalCase], sites: dict[str, Site]) -> list[EvalCase]:
+    """Copies of the scored cases with the current verifier's verdict and reason."""
+    from scrm.agents import verifier  # imported here: only this mode needs the agents
+    from scrm.telemetry import RunContext
+
+    scored = [c for c in cases if c.scored]
+    requests = [VerificationRequest(event=c.event, site=sites[c.site_id]) for c in scored]
+    results = await verifier.run_many(requests, RunContext.new())
+    return [
+        c.model_copy(update={"verifier_verdict": r.verdict, "verifier_reason": r.reason})
+        for c, r in zip(scored, results, strict=True)
+    ]
+
+
+def _load_sites(site_ids: list[str]) -> dict[str, Site]:
+    from scrm.agents import query_agent
+    from scrm.config import get_settings
+    from scrm.tools.bigquery_tool import BigQueryTool
+
+    tool = BigQueryTool.from_settings(get_settings())
+    return {s.site_id: s for s in query_agent.load_sites(tool, site_ids)}
+
+
 def main(argv: list[str] | None = None) -> int:
-    args = sys.argv[1:] if argv is None else argv
-    print(report(load_cases(Path(args[0]) if args else DEFAULT_DATASET)))
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("dataset", nargs="?", type=Path, default=DEFAULT_DATASET)
+    parser.add_argument(
+        "--rerun-verifier", action="store_true", help="also score the current verifier"
+    )
+    args = parser.parse_args(sys.argv[1:] if argv is None else argv)
+    cases = load_cases(args.dataset)
+    print("# Stored verdicts (verifier at the time of each run)\n")
+    print(report(cases))
+    if args.rerun_verifier:
+        scored = [c for c in cases if c.scored]
+        sites = _load_sites(sorted({c.site_id for c in scored}))
+        print("\n# Current verifier, re-run on the labelled cases\n")
+        print(report(asyncio.run(rerun_verifier(scored, sites))))
     return 0
 
 

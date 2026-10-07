@@ -10,7 +10,8 @@ Each signal is scaled to 0..1 and combined with fixed weights:
 Lessons from the P05 runs that shaped this:
 - Being geocoded inside the radius, or naming the site's city, is weak evidence: articles
   about Rotterdam the city (housing, drug cases, a travel guide) were all false positives.
-  Only naming the site, its operator or its company earns site credit.
+  Only naming the site, its operator or its company (or an alias from entity_resolver)
+  earns site credit, and it is the strongest single signal after themes.
 - Wide coverage alone is not relevance: big political stories in a nearby city got many
   articles. So the cluster signal amplifies relevance rather than adding to it: it is
   scaled by the stronger of the theme and site signals.
@@ -21,9 +22,10 @@ from dataclasses import dataclass
 from functools import lru_cache
 from math import log2
 
+from scrm.agents import entity_resolver
 from scrm.schemas import Site
 
-WEIGHTS = {"themes": 0.45, "site": 0.25, "cluster": 0.10, "tone": 0.10, "distance": 0.10}
+WEIGHTS = {"themes": 0.40, "site": 0.30, "cluster": 0.10, "tone": 0.10, "distance": 0.10}
 
 # GDELT GKG themes that signal a port or shipping disruption. Strong themes are about
 # ports and ships directly; weaker ones are disruptive but not shipping-specific.
@@ -125,21 +127,21 @@ def name_phrases(site_name: str) -> list[str]:
 
 
 @lru_cache(maxsize=64)
-def _identity_pattern(site_name: str, company: str | None) -> re.Pattern[str]:
+def _identity_pattern(site_name: str, aliases: tuple[str, ...]) -> re.Pattern[str]:
     alternatives = []
     for name in name_phrases(site_name):
         n = re.escape(name)
         # "<name>... <facility>" within two words, or "<facility> of <name>"
         alternatives.append(rf"\b{n}\w*(?: \w+)? (?:{FACILITY_WORDS})\b")
         alternatives.append(rf"\b(?:{FACILITY_WORDS}) (?:of |van )?{n}\b")
-    if company:
-        alternatives.append(rf"\b{re.escape(_phrase(company))}\b")
+    # The company and its aliases (entity_resolver.SITE_ALIASES) count on their own.
+    alternatives += [rf"\b{re.escape(_phrase(alias))}\b" for alias in aliases if _phrase(alias)]
     return re.compile("|".join(alternatives))
 
 
 def site_match_score(site: Site, slug: str, organizations: list[str], place: str | None) -> float:
     """1.0 if the URL slug, an organisation or the place names the site itself, else 0.0."""
-    identity = _identity_pattern(site.site_name, site.company)
+    identity = _identity_pattern(site.site_name, entity_resolver.aliases_for(site))
     # Match each place component separately, so "South Channel, Shanghai" does not read
     # as "channel shanghai".
     places = (place or "").split(",")

@@ -80,3 +80,14 @@ def test_brief_markdown_must_link_supporting_sources(date_range):
     )
     with pytest.raises(ValidationError, match=r"example.com/b"):
         RiskBrief(**common, markdown="- c ([source](https://example.com/a))")
+
+
+def test_scope_must_agree_with_verdict(event):
+    from scrm.schemas import Scope, Verdict, VerifiedEvent
+
+    common = dict(event=event, reason="r", evidence_url=event.source_url)
+    VerifiedEvent(**common, verdict=Verdict.YES, scope=Scope.INDIRECT, quote="q")
+    VerifiedEvent(**common, verdict=Verdict.NO, scope=Scope.NOT_RELEVANT)
+    VerifiedEvent(**common, verdict=Verdict.YES, quote="q")  # legacy runs have no scope
+    with pytest.raises(ValidationError, match="contradicts"):
+        VerifiedEvent(**common, verdict=Verdict.NO, scope=Scope.DIRECT)

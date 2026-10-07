@@ -1,26 +1,34 @@
 """Orchestrator: takes a site list and date range, routes work, assembles the brief.
 
 Pipeline, per site and with sites running concurrently:
-    query_agent -> verifier (one article per story cluster) -> risk_scorer ("yes" only)
+    query_agent    up to 50 ranked story clusters (location and entity retrieval)
+    triage         one model call: which stories are plausibly a disruption here
+    verifier       reads one article per triaged story: direct / indirect / not relevant
+    risk_scorer    severity and impact for confirmed stories
+    investigator   corroborates findings with risk >= 12, and unverifiable ones
 then once for all sites:
-    report_writer -> one brief, ordered by risk score
+    report_writer  one brief: direct findings first, then indirect, then investigated
+                   unverifiable stories; each section ordered by risk
 
 The orchestrator is deterministic Python rather than an LLM: the order of steps is fixed,
 so letting a model choose it would add cost and non-determinism without benefit. Every
 step runs inside the caller's RunContext, so one run ID flows through all logs and model
-calls are counted per agent. entity_resolver is not wired in yet.
+calls are counted per agent. Model work across all sites shares one concurrency limit.
 
 Input:  BriefRequest
 Output: RiskBrief (``run_pipeline`` also returns the per-site detail behind it)
 """
 
 import asyncio
+from datetime import date
 
-from scrm.agents import query_agent, report_writer, risk_scorer, verifier
+from scrm.agents import investigator, query_agent, report_writer, risk_scorer, triage, verifier
 from scrm.config import get_settings
 from scrm.schemas import (
     BriefRequest,
     DateRange,
+    Event,
+    Investigation,
     PipelineResult,
     QueryRequest,
     ReportRequest,
@@ -29,6 +37,7 @@ from scrm.schemas import (
     ScoringRequest,
     Site,
     SiteRun,
+    TriageResult,
     Verdict,
     VerificationRequest,
     VerifiedEvent,
@@ -40,11 +49,19 @@ NAME = "orchestrator"
 INPUT_SCHEMA = BriefRequest
 OUTPUT_SCHEMA = RiskBrief
 
-CANDIDATES_PER_SITE = 20
-# Model calls in flight at once, across all sites, to stay well inside Gemini quotas.
+CANDIDATES_PER_SITE = triage.MAX_CANDIDATES
+# Model work in flight at once, across all sites, to stay well inside Gemini quotas.
+# An investigation holds one slot for all of its model and tool calls.
 MAX_CONCURRENT_MODEL_CALLS = 8
 
 log = get_logger(__name__)
+
+
+async def _triage(
+    site: Site, events: list[Event], ctx: RunContext, limit: asyncio.Semaphore
+) -> TriageResult:
+    async with limit:
+        return await triage.run(site, events, ctx)
 
 
 async def _score_confirmed(
@@ -63,6 +80,28 @@ async def _score_confirmed(
     return [s for s in scores if s is not None]
 
 
+async def _investigate(
+    verified: list[VerifiedEvent],
+    scores: list[RiskScore],
+    site: Site,
+    search_until: date,
+    tool: BigQueryTool,
+    limit: asyncio.Semaphore,
+) -> list[Investigation]:
+    by_url = {str(s.source_url): s for s in scores}
+
+    async def one(event: VerifiedEvent) -> Investigation | None:
+        async with limit:
+            score = by_url.get(str(event.evidence_url))
+            return await investigator.run(event, score, site, search_until, tool)
+
+    todo = [
+        v for v in verified if investigator.needs_investigation(v, by_url.get(str(v.evidence_url)))
+    ]
+    results = await asyncio.gather(*(one(v) for v in todo))
+    return [r for r in results if r is not None]
+
+
 async def _run_site(
     site: Site,
     date_range: DateRange,
@@ -76,23 +115,31 @@ async def _run_site(
         tool=tool,
         sites=[site],
     )
+    triaged = await _triage(site, query.events, ctx, limit)
+    chosen = {s.event_id for s in triaged.selected}
+    to_verify = [e for e in query.events if e.event_id in chosen]
     verified = await verifier.run_many(
-        [VerificationRequest(event=e, site=site) for e in query.events], ctx, limit=limit
+        [VerificationRequest(event=e, site=site) for e in to_verify], ctx, limit=limit
     )
     scores = await _score_confirmed(verified, site, ctx, limit)
+    investigations = await _investigate(verified, scores, site, date_range.end, tool, limit)
     log.info(
         "orchestrator.site_done",
         extra={
             "site_id": site.site_id,
             "candidates": len(query.events),
+            "triaged_in": len(to_verify),
             "confirmed": len(scores),
+            "investigated": len(investigations),
         },
     )
     return SiteRun(
         site=site,
         candidates=query.events,
+        triage=triaged,
         verified_events=verified,
         scores=scores,
+        investigations=investigations,
         bytes_processed=query.bytes_processed,
     )
 
@@ -116,6 +163,8 @@ async def run_pipeline(
                 sites=sites,
                 verified_events=[v for r in site_runs for v in r.verified_events],
                 scores=[s for r in site_runs for s in r.scores],
+                investigations=[i for r in site_runs for i in r.investigations],
+                considered={r.site.site_id: len(r.candidates) for r in site_runs},
             ),
             ctx,
         )

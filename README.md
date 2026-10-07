@@ -9,27 +9,29 @@ The demo company is a fictional laptop maker with 22 real sites: 12 supplier fac
 
 > Status: the pipeline runs end to end for any list of sites
 > (`uv run --env-file .env python scripts/run_brief.py --sites P05 S01 C01 P02`), producing one
-> brief ordered by risk. The entity resolver is still a stub, and ranking precision is the
-> main open problem (see CLAUDE.md).
+> brief ordered by risk. Open problems are tracked in CLAUDE.md.
 
 ## How it works
 
 ```
 BriefRequest(sites, dates)
   per site, in parallel:
-  -> query_agent       SQL over scrm.* tables (dry-run guarded), ranked,
-                       same-story articles clustered                    -> Event[]
-  -> verifier          reads one article per story, rejects false
-                       positives, quotes its evidence                   -> VerifiedEvent[]
+  -> query_agent       SQL over scrm.* tables (dry-run guarded): nearby articles plus
+                       articles naming the site's company (entity_resolver); ranked,
+                       same-story articles clustered                    -> Event[] (top 50)
+  -> triage            one model call: which stories could be a disruption here
+  -> verifier          reads one article per story: direct / indirect /
+                       not relevant, with a verbatim quote              -> VerifiedEvent[]
   -> risk_scorer       severity and impact, 1 to 5, with a reason      -> RiskScore[]
+  -> investigator      agent with search and fetch tools; corroborates
+                       risk >= 12 and unverifiable findings             -> Investigation[]
   then once:
-  -> report_writer     one Markdown brief ordered by risk, a source
-                       link on every claim                              -> RiskBrief
+  -> report_writer     one Markdown brief: direct, then indirect, then
+                       investigated unverifiable; a source on every claim -> RiskBrief
 ```
 
 The `orchestrator` runs these steps as plain Python and gives each run a run ID that
-appears in every log line, so one brief can be traced end to end. The entity resolver
-(messy GDELT names to known companies) is planned but not wired in yet.
+appears in every log line, so one brief can be traced end to end.
 
 Built with [Google ADK](https://adk.dev/), Gemini on Gemini Enterprise Agent Platform
 (formerly Vertex AI), BigQuery, Pydantic v2 and FastAPI.
